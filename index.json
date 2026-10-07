@@ -334,6 +334,56 @@
         }
       }
     },
+        {
+      "key": "supjavnew",
+      "name": "SupJavnew",
+      "type": 3,
+      "quickSearch": 0,
+      "searchable": 1,
+      "changeable": 0,
+      "filterable": 1,
+      "timeout": 60,
+      "style": {
+        "type": "rect",
+        "ratio": 1.48
+      },
+      "api": "csp_GM",
+      "ext": {
+        "userScript": "./userScripts/supjavnew.user.js",
+        "subtitle": true,
+        "webViewSettings": {
+          "blockNetworkImage": true,
+          "blockCssAndFont": true,
+          "allowList": [
+            "https://*.supremejav.com/*",
+            "https://fc2stream.tv/*",
+            "https://ajax.googleapis.com/*",
+            "https://*.jwpcdn.com/*"
+          ]
+        },
+        "playUrlMatch": [
+          "https://fc2stream.tv/*/master.m3u8",
+          "https://*turbovi*/*.m3u8*",
+          "https://streamtape.com/get_video*",
+          "https://*.tapecontent.net/*",
+          "https://*.cloudwindow-route.com/*/index-v1-a1.m3u8*"
+        ],
+        "spider": {
+          "homeContent": {
+            "loadUrl": "https://supjav.com/zh/popular"
+          },
+          "categoryContent": {
+            "loadUrl": "https://supjav.com/zh/${tid}/page/${pg:-1}?sort=${sort:-quantity}"
+          },
+          "detailContent": {
+            "loadUrl": "https://supjav.com/zh/${id}"
+          },
+          "searchContent": {
+            "loadUrl": "https://supjav.com/zh/page/${pg:-1}?s=${key}"
+          }
+        }
+      }
+    },
     {
       "key": "XOJAV",
       "name": "XOJAV",
