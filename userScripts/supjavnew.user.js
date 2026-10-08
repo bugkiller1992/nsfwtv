@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Supjav
 // @namespace    gmspider
-// @version      2026.10.08.2
+// @version      2026.10.08.3
 // @description  Supjav GMSpider（兼容新版播放器 + 屏蔽广告/弹窗视频）
 // @author       Luomo
 // @match        https://supjav.com/*
@@ -28,6 +28,10 @@
     // "navigate"：直接跳转到播放器页面（VAS 最快；EVS 会提示“播放地址加载失败”）
     // "iframe"：等 supjav 页面加载完，再在页面里嵌入播放器（最慢，最保守）
     const PLAYER_OPEN = "inplace";
+    // 播放器嗅探到地址、App 开始播放后，网页里的播放器可能还在后台加载同一个视频，和 App 抢带宽。
+    // 设成毫秒数（如 15000）：播放器页面加载后过这么久，就关掉网页里的播放器。0 = 不关闭。
+    // 注意：设得太短，App 还没嗅探到地址就关了，会直接播放失败。
+    const RELEASE_PLAYER_MS = 15000;
     // 等待页面的最长时间（毫秒），超时后用已有内容返回结果，避免 App 一直转圈
     const MAX_WAIT_MS = 20000;
 
@@ -688,7 +692,22 @@
         } catch (e) {
             console.error(e);
         }
-        return !!document.querySelector("iframe[data-gm-player='1']");
+        const frame = document.querySelector("iframe[data-gm-player='1']");
+        if (frame && RELEASE_PLAYER_MS > 0) {
+            let released = false;
+            frame.addEventListener("load", function () {
+                if (released) return;
+                released = true;
+                setTimeout(function () {
+                    try {
+                        frame.src = "about:blank";
+                        frame.remove();
+                    } catch (e) {
+                    }
+                }, RELEASE_PLAYER_MS);
+            });
+        }
+        return !!frame;
     }
 
     let fastTried = false;
