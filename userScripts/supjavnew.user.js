@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Supjav
 // @namespace    gmspider
-// @version      2025.11.12
+// @version      2025.11.13
 // @description  Supjav GMSpider
 // @author       Luomo
 // @match        https://supjav.com/*
@@ -153,13 +153,28 @@
                 }
                 let vodPlayData = [];
                 
-                // 【修改点 1】：扩展播放线路选择器，兼容 EVS 及其他新型播放线路标签
-                let btnServers = jQuery(".video-wrap .btn-server, .video-wrap [data-link], .cd-server .btn-server, .servers .btn");
-                if (btnServers.length === 0) {
-                    btnServers = jQuery(".btn-server, [data-link]");
+                // 【核心修正】：严格使用原版安全选择器，仅对拥有 data-link 属性且属于线路按钮的元素进行收录，彻底排查并过滤广告诱导节点
+                let btnServers;
+                if (jQuery(".video-wrap .cd-server").length > 0) {
+                    btnServers = jQuery(".video-wrap .cd-server:first .btn-server, .video-wrap .cd-server:first [data-link]");
+                } else {
+                    btnServers = jQuery(".video-wrap .btn-server, .video-wrap [data-link]");
+                }
+                
+                // 去重并过滤掉文本为空或疑似广告的节点
+                let validServers = [];
+                btnServers.each(function () {
+                    let text = jQuery(this).text().trim();
+                    let dataLink = jQuery(this).attr("data-link");
+                    if (text && dataLink && !validServers.includes(this)) {
+                        validServers.push(this);
+                    }
+                });
+                if (validServers.length === 0) {
+                    validServers = btnServers.toArray();
                 }
 
-                btnServers.each(function (i) {
+                jQuery(validServers).each(function (i) {
                     let serverName = jQuery(this).text().trim() || ('线路' + (i + 1));
                     vodPlayData.push({
                         from: serverName,
@@ -188,11 +203,27 @@
             playerContent: function (flag, id, vipFlags) {
                 const link = window.location.hash.split("#").at(1);
                 
-                // 【修改点 2】：同步扩展 playerContent 中的点击目标，并触发更完整的事件以兼容新播放器
-                const buttons = document.querySelectorAll('.video-wrap .btn-server, .video-wrap [data-link], .cd-server .btn-server, .servers .btn, .btn-server, [data-link]');
-                if (buttons[link]) {
-                    buttons[link].click();
-                    buttons[link].dispatchEvent(new Event("click", { bubbles: true }));
+                // 【核心修正】：与 detailContent 的筛选逻辑保持完全一致，确保索引对应无误且不触发广告
+                let btnServers;
+                if (document.querySelectorAll(".video-wrap .cd-server").length > 0) {
+                    btnServers = document.querySelectorAll(".video-wrap .cd-server")[0].querySelectorAll(".btn-server, [data-link]");
+                } else {
+                    btnServers = document.querySelectorAll(".video-wrap .btn-server, .video-wrap [data-link]");
+                }
+                
+                let validButtons = [];
+                btnServers.forEach(function (el) {
+                    if (el.textContent.trim() && el.getAttribute("data-link") && !validButtons.includes(el)) {
+                        validButtons.push(el);
+                    }
+                });
+                if (validButtons.length === 0) {
+                    validButtons = btnServers;
+                }
+
+                if (validButtons[link]) {
+                    validButtons[link].click();
+                    validButtons[link].dispatchEvent(new Event("click", { bubbles: true }));
                 }
                 
                 return {
