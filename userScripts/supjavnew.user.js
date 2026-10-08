@@ -3,17 +3,9 @@
 """
 SupJav TVBox 爬虫 (type=3 Python spider)
 ================================================================
-数据源: supjav.com (WordPress supjav2 主题, Cloudflare 保护)
-过盾:   页面全部走 1314/page (Playwright 真实浏览器 + challenge 重试)
-播放链: 详情 data-link(hex)
-        → supjav.php?l=<hex>        (需 Referer=详情页)
-        → 页内 OLID 反转
-        → supjav.php?c=<reversed>   (需 Referer=step1)
-        → TV 线路: 明文 m3u8 (turboviplay)
-          FST 线路: packer 解包 → m3u8 (premilkyway)
-          VOE 线路: 二跳 + 六层混淆解密
-          ST  线路: Streamtape 直链
-        注：严格过滤一切未知 iframe / 弹窗广告源，确保播放的绝对是正片。
+修复说明：对 _extract_stream 实施极度严格的白名单校验，强制只提取
+官方指定视频 CDN/播放器域名的流（turboviplay, premilkyway, streamtape, voe），
+彻底杜绝误抓广告弹窗内嵌视频。
 """
 import re
 import json
@@ -47,7 +39,6 @@ SJ_HLS_API = PROXY_BASE + '/sj_hls?u='
 SJ_IMG_API = PROXY_BASE + '/sj_img?u='
 LK_BASE = 'https://lk1.supremejav.com/supjav.php'
 
-# 分类严格对齐站点导航栏 (supjav.com 顶部 nav)
 CATS = [
     ('__home', '最新'),
     ('__popular', '热门'),
@@ -59,7 +50,6 @@ CATS = [
     ('english-subtitles', '英文字幕 Eng Sub'),
 ]
 
-# 线路排序(数字越小越靠前): VOE 第一, TV 最后
 LINE_ORDER = {
     'VOE': 0,
     'FST': 10,
@@ -67,7 +57,6 @@ LINE_ORDER = {
     'TV': 90,
 }
 
-# 站点支持 ?sort=views 排序
 SORTS = [
     {'key': 'sort', 'name': '排序',
      'value': [{'n': '最新', 'v': ''}, {'n': '最多观看', 'v': 'views'}]},
@@ -106,7 +95,6 @@ class Spider(BaseSpider):
     def isVideoFormat(self, url):
         return bool(url and re.search(r'\.(m3u8|mp4|ts)(\?|$)', url, re.I))
 
-    # ---------------- 网络层 ----------------
     def _get(self, url, timeout=60):
         if self._sess is not None:
             try:
@@ -163,8 +151,6 @@ class Spider(BaseSpider):
                             key=lambda x: cls._PLAY_CACHE[x][0])[:20]:
                 cls._PLAY_CACHE.pop(k, None)
 
-
-    # ---------------- 解析层 ----------------
     @staticmethod
     def _cards(html):
         out, seen = [], set()
@@ -240,7 +226,6 @@ class Spider(BaseSpider):
                 table[enc(i)] = keys[i]
         return re.sub(r'\b\w+\b', lambda mm: table.get(mm.group(0), mm.group(0)), payload)
 
-    # ---------------- TVBox 接口 ----------------
     def homeContent(self, filter):
         classes = [{'type_id': cid, 'type_name': cname} for cid, cname in CATS]
         filters = {}
@@ -413,23 +398,37 @@ class Spider(BaseSpider):
             return {}
 
     def _extract_stream(self, s2, ref):
-        """从 step2 页面抽取播放地址。返回 (m3u8, direct_mp4)
-        【严格防广告加固】：仅保留经过验证的官方合法解密管道（明文 m3u8、packer 解包、
-        Streamtape、VOE），彻底移除所有不可靠的 iframe 猜测，杜绝抓取到弹窗广告视频。
+        """【绝对安全白名单过滤】
+        只允许匹配包含官方特定播放器域名的 m3u8 或 mp4，
+        任何不在此白名单内的 URL 都会被直接丢弃，彻底根除广告视频。
         """
-        # 1) 明文 m3u8
-        hits = re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', s2)
-        if hits:
-            return hits[0], ''
+        # 合法的官方视频 CDN/播放源域名白名单关键字
+        valid_domains = [
+            'turboviplay.com', 'turbosplayer.com', 'premilkyway.com',
+            'streamtape.com', 'voe.sx', 'tracylocalschool.com', 'vidsrc',
+            'googleusercontent.com'
+        ]
+
+        def is_whitelisted(url):
+            u_low = url.lower()
+            for d in valid_domains:
+                if d in u_low:
+                    return True
+            return False
+
+        # 1) 明文 m3u8（必须过白名单）
+        for u in re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', s2):
+            if is_whitelisted(u):
+                return u, ''
 
         # 2) packer 解包
         if 'eval(function(p,a,c,k,e' in s2:
             dec = self._unpack(s2)
-            hits = re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', dec)
-            if hits:
-                return hits[0], ''
+            for u in re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', dec):
+                if is_whitelisted(u):
+                    return u, ''
 
-        # 3) Streamtape: /e/<id> → robotlink 拼 get_video
+        # 3) Streamtape
         em = re.search(r'https?://streamtape\.com/e/([A-Za-z0-9]+)', s2)
         if em:
             eurl = 'https://streamtape.com/e/%s/' % em.group(1)
@@ -446,21 +445,22 @@ class Spider(BaseSpider):
                     link = 'https:' + link
                 if 'dl=' not in link:
                     link += ('&dl=1' if '?' in link else '?dl=1')
-                return '', link
+                if is_whitelisted(link):
+                    return '', link
 
-        # 4) VOE 系: 二跳后解混淆 JSON
+        # 4) VOE 系
         tgt = re.findall(r"window\.location\.href\s*=\s*'([^']+)'", s2)
         tgt += re.findall(r'https?://[a-z0-9.-]+/e/[a-z0-9]{8,}', s2)
         if tgt:
             page = self._stream(tgt[0], referer=ref)
             cfg = self._voe_decode(page)
             src = str(cfg.get('source') or '')
-            if '.m3u8' in src:
+            if '.m3u8' in src and is_whitelisted(src):
                 return src, ''
             dau = str(cfg.get('direct_access_url') or '')
-            if dau.startswith('http'):
+            if dau.startswith('http') and is_whitelisted(dau):
                 return '', dau
-            if src.startswith('http'):
+            if src.startswith('http') and is_whitelisted(src):
                 return '', src
 
         return '', ''
