@@ -452,27 +452,30 @@ class Spider(BaseSpider):
 
     def _extract_stream(self, s2, ref):
         """从 step2 页面抽取播放地址。返回 (m3u8, direct_mp4)
-
-        supjav 各线路解析:
-          TV  turboviplay  → 页内明文 m3u8
-          FST premilkyway  → packer 解包后 m3u8
-          ST  streamtape   → 二跳 embed 页, robotlink 拼接 get_video 直链
-          VOE tracylocal.. → 二跳 + application/json 六层混淆, 取 source(m3u8)
-          EVS / VAS / LUC  → 页面包含 iframe / embed 嵌套或重定向, 需二次递归抓取
+        严格过滤广告域名与非视频跳转，确保只抓取正片。
         """
-        # 1) 明文 m3u8[cite: 8]
-        hits = re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', s2)
+        ad_domains = ['ads', 'traffic', 'popunder', 'click', 'stat', 'analytics', 'counter', 'banner', 'syndication', 'acervids', 'creative']
+
+        def is_valid_video_url(url):
+            u_low = url.lower()
+            for ad in ad_domains:
+                if ad in u_low:
+                    return False
+            return True
+
+        # 1) 明文 m3u8（过滤广告）
+        hits = [u for u in re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', s2) if is_valid_video_url(u)]
         if hits:
             return hits[0], ''
 
-        # 2) packer 解包[cite: 8]
+        # 2) packer 解包
         if 'eval(function(p,a,c,k,e' in s2:
             dec = self._unpack(s2)
-            hits = re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', dec)
+            hits = [u for u in re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', dec) if is_valid_video_url(u)]
             if hits:
                 return hits[0], ''
 
-        # 3) Streamtape: /e/<id> → robotlink 拼 get_video[cite: 8]
+        # 3) Streamtape: /e/<id> → robotlink 拼 get_video
         em = re.search(r'https?://streamtape\.com/e/([A-Za-z0-9]+)', s2)
         if em:
             eurl = 'https://streamtape.com/e/%s/' % em.group(1)
@@ -489,46 +492,43 @@ class Spider(BaseSpider):
                     link = 'https:' + link
                 if 'dl=' not in link:
                     link += ('&dl=1' if '?' in link else '?dl=1')
-                return '', link
+                if is_valid_video_url(link):
+                    return '', link
 
-        # 4) VOE 系: 二跳后解混淆 JSON[cite: 8]
+        # 4) VOE 系: 二跳后解混淆 JSON
         tgt = re.findall(r"window\.location\.href\s*=\s*'([^']+)'", s2)
         tgt += re.findall(r'https?://[a-z0-9.-]+/e/[a-z0-9]{8,}', s2)
         if tgt:
             page = self._stream(tgt[0], referer=ref)
             cfg = self._voe_decode(page)
             src = str(cfg.get('source') or '')
-            if '.m3u8' in src:
+            if '.m3u8' in src and is_valid_video_url(src):
                 return src, ''
             dau = str(cfg.get('direct_access_url') or '')
-            if dau.startswith('http'):
+            if dau.startswith('http') and is_valid_video_url(dau):
                 return '', dau
-            if src.startswith('http'):
+            if src.startswith('http') and is_valid_video_url(src):
                 return '', src
 
-        # 5) 新增: EVS / VAS / LUC 等线路的 iframe 嵌套 / 动态跳转二次抓取
-        # 匹配页面中的 iframe src 或直连跳转地址
+        # 5) EVS / VAS / LUC 等线路：只抓取真正的视频播放域 iframe/embed
         sub_urls = re.findall(r'src="(https?://[^"]+/(?:e|embed|v|player|iframe)/[^"]+)"', s2, re.I)
-        sub_urls += re.findall(r'window\.location\.href\s*=\s*[\'"](https?://[^\'"]+)[\'"]', s2)
-        if not sub_urls:
-            # 兜底匹配任意外部视频播放域链接
-            sub_urls = re.findall(r'https?://[a-z0-9.-]+/(?:e|embed|v|player)/[a-z0-9-_]+', s2, re.I)
+        sub_urls += re.findall(r'https?://[a-z0-9.-]+/(?:e|embed|v|player)/[a-z0-9-_]+', s2, re.I)
+        
+        valid_sub_urls = [u for u in sub_urls if is_valid_video_url(u)]
 
-        for sub_url in sub_urls[:3]:
+        for sub_url in valid_sub_urls[:3]:
             sub_page = self._stream(sub_url, referer=ref)
             if not sub_page:
                 continue
-            # 在子页面中递归查找 m3u8 或 mp4
-            sub_hits = re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', sub_page)
+            sub_hits = [u for u in re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', sub_page) if is_valid_video_url(u)]
             if sub_hits:
                 return sub_hits[0], ''
-            sub_mp4 = re.findall(r'https?://[^\s"\'<>\\]+\.mp4[^\s"\'<>\\]*', sub_page)
+            sub_mp4 = [u for u in re.findall(r'https?://[^\s"\'<>\\]+\.mp4[^\s"\'<>\\]*', sub_page) if is_valid_video_url(u)]
             if sub_mp4:
                 return sub_mp4[0], ''
-            # 尝试在子页面中再次解包或解混淆
             if 'eval(function(p,a,c,k,e' in sub_page:
                 dec_sub = self._unpack(sub_page)
-                dec_hits = re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', dec_sub)
+                dec_hits = [u for u in re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', dec_sub) if is_valid_video_url(u)]
                 if dec_hits:
                     return dec_hits[0], ''
 
