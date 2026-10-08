@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Supjav
 // @namespace    gmspider
-// @version      2026.10.07.3
+// @version      2026.10.07.4
 // @description  Supjav GMSpider（兼容新版播放器 + 屏蔽广告/弹窗视频）
 // @author       Luomo
 // @match        https://supjav.com/*
@@ -48,18 +48,19 @@
     }
 
     /* ======================= 广告/弹窗屏蔽 ======================= */
+    // supjav 主页面本身从不直接播放正片（正片都在播放器 iframe 里），
+    // 因此主页面上的任何音视频元素 / 视频网络请求一律视为广告。
+    const MEDIA_URL_RE = /\.(m3u8|mp4|m4v|m4s|ts|flv|webm|mpd|mov)(\?|#|$)|[?&/](vast|vpaid|preroll)[=/_.-]/i;
+    const SCRIPT_ALLOW_RE = /(^|\.)(cloudflare\.com|jquery\.com|jsdelivr\.net|googleapis\.com|gstatic\.com)$/i;
     const AdGuard = (function () {
         let installed = false;
 
-        // 本页（supjav 主站）本身不存在正片 <video>，正片都在播放器 iframe 里，
-        // 所以主页面上的 video/audio 一律视为广告
         function killMedia(el) {
             try {
                 el.pause && el.pause();
                 el.muted = true;
                 el.removeAttribute("src");
                 el.querySelectorAll && el.querySelectorAll("source").forEach(s => s.remove());
-                el.load && el.load();
             } catch (e) {
             }
             el.remove();
@@ -69,21 +70,10 @@
             return el && el.getAttribute && el.getAttribute("data-gm-player") === "1";
         }
 
-        function isAdBox(el) {
-            if (!el || el.nodeType !== 1) return false;
-            if (el.matches && el.matches(".post, .posts, .video-wrap, .post-meta, .pagination, .categorys, body, html")) return false;
+        // 轻量判断（只看 class/id，不触发样式计算，解析期间可以对每个节点调用）
+        function isAdByName(el) {
             const cls = typeof el.className === "string" ? el.className : "";
-            if (AD_CLASS_RE.test(cls) || AD_CLASS_RE.test(el.id || "")) return true;
-            // 全屏/悬浮遮罩层（弹窗广告常用）
-            try {
-                const st = getComputedStyle(el);
-                if ((st.position === "fixed" || st.position === "sticky") && parseInt(st.zIndex, 10) >= 999 &&
-                    (el.querySelector("a[target=_blank], iframe, video") || el.tagName === "A")) {
-                    return true;
-                }
-            } catch (e) {
-            }
-            return false;
+            return AD_CLASS_RE.test(cls) || AD_CLASS_RE.test(el.id || "");
         }
 
         function handleNode(node) {
@@ -97,11 +87,25 @@
                 if (!isOurPlayer(node)) node.remove();
                 return;
             }
-            if (isAdBox(node) && !node.querySelector("[data-gm-player='1']")) {
+            if (tag === "SCRIPT") {
+                // 第三方脚本（广告联盟、弹窗、统计）直接不执行；列表/详情数据都在静态 HTML 里，不依赖它们
+                const src = node.getAttribute("src");
+                if (src) {
+                    const u = safeUrl(src);
+                    if (u && !SITE_HOST_RE.test(u.hostname) && !SCRIPT_ALLOW_RE.test(u.hostname)) {
+                        node.type = "javascript/blocked";
+                        node.remove();
+                    }
+                }
+                return;
+            }
+            if (tag === "META" || tag === "LINK" || tag === "STYLE") return;
+            if (isAdByName(node) && !node.querySelector("[data-gm-player='1']")) {
                 node.remove();
                 return;
             }
-            if (node.querySelectorAll) {
+            // 只有带子元素的节点才往下查
+            if (node.firstElementChild) {
                 node.querySelectorAll("video, audio").forEach(killMedia);
                 node.querySelectorAll("iframe, embed, object").forEach(f => {
                     if (!isOurPlayer(f)) f.remove();
@@ -109,19 +113,102 @@
             }
         }
 
+        // 一次性清理（只在 DOM ready / 播放前调用，不在解析期间调用）
         function clean() {
             if (!document.documentElement) return;
-            handleNode(document.documentElement);
-            document.querySelectorAll("div, section, aside, a, ins").forEach(el => {
-                if (el.isConnected && isAdBox(el) && !el.querySelector("[data-gm-player='1']")) el.remove();
+            document.querySelectorAll("video, audio").forEach(killMedia);
+            document.querySelectorAll("iframe, embed, object").forEach(f => {
+                if (!isOurPlayer(f)) f.remove();
             });
+            document.querySelectorAll("[class*=ad], [id*=ad], [class*=banner], [class*=popup], [class*=sponsor], ins").forEach(el => {
+                if (el.isConnected && el !== document.body && isAdByName(el) && !el.querySelector("[data-gm-player='1']")) el.remove();
+            });
+            // 悬浮/全屏遮罩只检查 body 的直接子元素，避免对整页做样式计算
+            if (document.body) {
+                Array.from(document.body.children).forEach(el => {
+                    if (el.querySelector && el.querySelector("[data-gm-player='1']")) return;
+                    try {
+                        const st = getComputedStyle(el);
+                        if (st.position === "fixed" && parseInt(st.zIndex, 10) >= 999) el.remove();
+                    } catch (e) {
+                    }
+                });
+            }
+        }
+
+        // 结果交给 App 之后，冻结页面：停止加载、清掉网站的定时器（广告轮播/重试），
+        // 让这个 WebView 不再产生任何请求，也不再占用 CPU
+        function freeze(stopLoading) {
+            // 播放页不调用 window.stop()：它会让页面的 load 事件不再触发，部分播放器靠它开始嗅探
+            if (stopLoading) {
+                try {
+                    window.stop();
+                } catch (e) {
+                }
+            }
+            try {
+                const maxId = setTimeout(function () {
+                }, 0);
+                for (let i = 0; i <= maxId; i++) {
+                    clearTimeout(i);
+                    clearInterval(i);
+                }
+            } catch (e) {
+            }
+        }
+
+        function blockMediaRequests() {
+            // fetch
+            try {
+                const origFetch = W.fetch;
+                if (origFetch) {
+                    const f = function (input, init) {
+                        const url = typeof input === "string" ? input : (input && input.url) || "";
+                        if (MEDIA_URL_RE.test(url)) return Promise.reject(new TypeError("blocked by gmspider"));
+                        return origFetch.apply(this, arguments);
+                    };
+                    W.fetch = f;
+                    window.fetch = f;
+                }
+            } catch (e) {
+            }
+            // XHR（hls.js 等广告播放器用它拉 m3u8 / ts 分片，删掉 <video> 也不会停）
+            try {
+                const XHR = (W.XMLHttpRequest || XMLHttpRequest).prototype;
+                const origOpen = XHR.open, origSend = XHR.send;
+                XHR.open = function (method, url) {
+                    this.__gmBlocked = MEDIA_URL_RE.test(String(url || ""));
+                    return origOpen.apply(this, arguments);
+                };
+                XHR.send = function () {
+                    if (this.__gmBlocked) {
+                        try {
+                            this.abort();
+                        } catch (e) {
+                        }
+                        return;
+                    }
+                    return origSend.apply(this, arguments);
+                };
+            } catch (e) {
+            }
+            // MSE：广告播放器用 MediaSource 喂数据，主页面直接禁用
+            try {
+                if (W.MediaSource) W.MediaSource.isTypeSupported = function () {
+                    return false;
+                };
+                if (W.ManagedMediaSource) W.ManagedMediaSource.isTypeSupported = function () {
+                    return false;
+                };
+            } catch (e) {
+            }
         }
 
         function install() {
             if (installed) return;
             installed = true;
 
-            // 1. 禁止弹窗/新窗口（WebView 会把 window.open 直接在当前页打开广告）
+            // 1. 禁止弹窗/新窗口
             const fakeWin = function () {
                 return {
                     closed: false, close() {
@@ -144,7 +231,7 @@
             } catch (e) {
             }
 
-            // 2. 拦截外站链接/弹窗点击（捕获阶段，优先于网站自己的 popunder 脚本）
+            // 2. 拦截外站链接/弹窗点击
             window.addEventListener("click", function (e) {
                 const a = e.target && e.target.closest ? e.target.closest("a") : null;
                 if (a && a.href) {
@@ -156,7 +243,7 @@
                 }
             }, true);
 
-            // 3. 主页面上的任何媒体一律禁止播放/加载
+            // 3. 主页面上的媒体元素禁止播放/加载
             try {
                 const proto = HTMLMediaElement.prototype;
                 proto.play = function () {
@@ -172,46 +259,47 @@
                         get: function () {
                             return srcDesc.get.call(this);
                         },
-                        set: function () { /* 拦截 */
+                        set: function () {
                         }
                     });
                 }
             } catch (e) {
             }
 
-            // 4. CSP：主页面禁止加载任何音视频（正片在播放器 iframe 里，不受影响）
+            // 4. 拦截视频网络请求（fetch / XHR / MSE）
+            blockMediaRequests();
+
+            // 5. CSP：主页面禁止加载音视频。meta CSP 只有放在 <head> 里才生效
             let cspAdded = false;
 
             function addCsp() {
-                if (cspAdded) return;
-                const parent = document.head || document.documentElement;
-                if (!parent) return;
+                if (cspAdded || !document.head) return;
                 const meta = document.createElement("meta");
                 meta.httpEquiv = "Content-Security-Policy";
                 meta.content = "media-src 'none'";
-                parent.insertBefore(meta, parent.firstChild);
+                document.head.insertBefore(meta, document.head.firstChild);
                 cspAdded = true;
             }
 
             addCsp();
 
-            // 5. 持续监听后插入的广告节点
+            // 6. 监听新插入的节点（只做轻量判断，避免列表页卡顿）
             const mo = new MutationObserver(function (list) {
                 if (!cspAdded) addCsp();
                 for (const m of list) {
-                    m.addedNodes && m.addedNodes.forEach(handleNode);
-                    if (m.type === "attributes" && m.target.tagName === "IFRAME" && !isOurPlayer(m.target)) {
-                        m.target.remove();
+                    if (m.type === "attributes") {
+                        if (m.target.tagName === "IFRAME" && !isOurPlayer(m.target)) m.target.remove();
+                        else if (m.target.tagName === "VIDEO" || m.target.tagName === "AUDIO") killMedia(m.target);
+                        continue;
                     }
+                    const nodes = m.addedNodes;
+                    for (let i = 0; i < nodes.length; i++) handleNode(nodes[i]);
                 }
             });
-            // document-start 时 documentElement 可能还不存在，监听 document 本身
             mo.observe(document, {childList: true, subtree: true, attributes: true, attributeFilter: ["src"]});
-
-            if (document.documentElement) clean();
         }
 
-        return {install, clean};
+        return {install, clean, freeze};
     })();
 
     // 尽早安装（不等 DOM ready），避免广告视频在 playerContent 之前就被嗅探到
@@ -503,7 +591,9 @@
                 if (!link) return {type: "match"};
 
                 // 不再点击网站按钮（会触发 popunder + 前贴片广告页），直接嵌入真实播放页
+                // 先清掉页面上的广告并冻结主页面（停止所有加载和网站定时器），再插入播放器
                 AdGuard.clean();
+                AdGuard.freeze(false);
                 const src = PLAY_MODE === "direct"
                     ? PLAYER_BASE + "supjav.php?c=" + encodeURIComponent(reverseStr(link))
                     : PLAYER_BASE + "supjav.php?l=" + encodeURIComponent(link) + "&bg=undefined";
@@ -530,7 +620,7 @@
     })();
 
     jQuery(function () {
-        AdGuard.clean();
+        const isPlayer = GMSpiderArgs.fName === "playerContent";
         let result;
         try {
             result = GmSpider[GMSpiderArgs.fName](...GMSpiderArgs.fArgs);
@@ -542,6 +632,8 @@
         if (typeof GmSpiderInject !== 'undefined') {
             GmSpiderInject.SetSpiderResult(JSON.stringify(result));
         }
+        // 列表/搜索/详情拿到数据后立即冻结页面，避免后台广告继续加载、拖慢 App
+        if (!isPlayer) AdGuard.freeze(true);
     });
 })();
 
