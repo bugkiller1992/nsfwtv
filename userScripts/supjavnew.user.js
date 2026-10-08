@@ -3,8 +3,16 @@
 """
 SupJav TVBox 爬虫 (type=3 Python spider)
 ================================================================
-修复说明：修正了 _extract_stream 盲目取 hits[0] 导致误抓广告 m3u8 的严重漏洞。
-现在对所有提取出的 m3u8 链接实施严格的白名单特征过滤。
+数据源: supjav.com (WordPress supjav2 主题, Cloudflare 保护)
+过盾:   页面全部走 1314/page (Playwright 真实浏览器 + challenge 重试)
+播放链: 详情 data-link(hex)
+        → supjav.php?l=<hex>        (需 Referer=详情页)
+        → 页内 OLID 反转
+        → supjav.php?c=<reversed>   (需 Referer=step1)
+        → TV 线路: 明文 m3u8 (turboviplay)
+          FST 线路: packer 解包 → m3u8 (premilkyway)
+          EVS/VOE等: 统一跟进 iframe / 二跳页面提取 m3u8/mp4
+          master m3u8 实测免 Referer 直连可播 → 直接给 TVBox
 """
 import re
 import json
@@ -38,6 +46,7 @@ SJ_HLS_API = PROXY_BASE + '/sj_hls?u='
 SJ_IMG_API = PROXY_BASE + '/sj_img?u='
 LK_BASE = 'https://lk1.supremejav.com/supjav.php'
 
+# 分类严格对齐站点导航栏
 CATS = [
     ('__home', '最新'),
     ('__popular', '热门'),
@@ -49,8 +58,10 @@ CATS = [
     ('english-subtitles', '英文字幕 Eng Sub'),
 ]
 
+# 线路排序(数字越小越靠前)
 LINE_ORDER = {
     'VOE': 0,
+    'EVS': 5,
     'FST': 10,
     'ST': 20,
     'TV': 90,
@@ -94,6 +105,7 @@ class Spider(BaseSpider):
     def isVideoFormat(self, url):
         return bool(url and re.search(r'\.(m3u8|mp4|ts)(\?|$)', url, re.I))
 
+    # ---------------- 网络层 ----------------
     def _get(self, url, timeout=60):
         if self._sess is not None:
             try:
@@ -150,6 +162,7 @@ class Spider(BaseSpider):
                             key=lambda x: cls._PLAY_CACHE[x][0])[:20]:
                 cls._PLAY_CACHE.pop(k, None)
 
+    # ---------------- 解析层 ----------------
     @staticmethod
     def _cards(html):
         out, seen = [], set()
@@ -397,32 +410,20 @@ class Spider(BaseSpider):
             return {}
 
     def _extract_stream(self, s2, ref):
-        """【已修复】引入白名单机制过滤广告 m3u8，绝不盲目取第一个匹配项"""
-        valid_domains = [
-            'turboviplay.com', 'turbosplayer.com', 'premilkyway.com',
-            'streamtape.com', 'voe.sx', 'tracylocalschool.com', 'vidsrc',
-            'googleusercontent.com'
-        ]
-
-        def is_whitelisted(url):
-            u_low = url.lower()
-            return any(d in u_low for d in valid_domains)
-
-        # 1) 明文 m3u8 遍历查找合法源
+        """增强的播放地址抽取（已适配 EVS、VOE、FST、TV、Streamtape 等全部线路）"""
+        # 1) 直接在当前页匹配明文 m3u8
         hits = re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', s2)
-        for u in hits:
-            if is_whitelisted(u):
-                return u, ''
+        if hits:
+            return hits[0], ''
 
-        # 2) packer 解包遍历查找合法源
+        # 2) Dean Edwards packer 解包
         if 'eval(function(p,a,c,k,e' in s2:
             dec = self._unpack(s2)
             hits = re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', dec)
-            for u in hits:
-                if is_whitelisted(u):
-                    return u, ''
+            if hits:
+                return hits[0], ''
 
-        # 3) Streamtape
+        # 3) Streamtape 线路
         em = re.search(r'https?://streamtape\.com/e/([A-Za-z0-9]+)', s2)
         if em:
             eurl = 'https://streamtape.com/e/%s/' % em.group(1)
@@ -439,23 +440,50 @@ class Spider(BaseSpider):
                     link = 'https:' + link
                 if 'dl=' not in link:
                     link += ('&dl=1' if '?' in link else '?dl=1')
-                if is_whitelisted(link):
-                    return '', link
+                return '', link
 
-        # 4) VOE 系
+        # 4) 【增强逻辑】统配 EVS、VOE 等二级页面、iframe、跳转链接
         tgt = re.findall(r"window\.location\.href\s*=\s*'([^']+)'", s2)
-        tgt += re.findall(r'https?://[a-z0-9.-]+/e/[a-z0-9]{8,}', s2)
-        if tgt:
-            page = self._stream(tgt[0], referer=ref)
+        tgt += re.findall(r'window\.location\.replace\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)', s2)
+        tgt += re.findall(r'<iframe[^>]+src=["\'](https?://[^"\']+)["\']', s2)
+        tgt += re.findall(r'https?://[a-z0-9.-]+/(?:e|embed|v|player|evs)/[a-zA-Z0-9_-]+', s2, re.I)
+        
+        seen_tgt = set()
+        for turl in tgt:
+            if turl in seen_tgt:
+                continue
+            seen_tgt.add(turl)
+            page = self._stream(turl, referer=ref)
+            if not page:
+                continue
+            
+            # 检查子页面中的 m3u8
+            sub_hits = re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', page)
+            if sub_hits:
+                return sub_hits[0], ''
+                
+            # 检查子页面中的 mp4 直链
+            mp4_hits = re.findall(r'https?://[^\s"\'<>\\]+\.mp4[^\s"\'<>\\]*', page)
+            if mp4_hits:
+                return '', mp4_hits[0]
+
+            # 检查 VOE 等混淆 JSON 结构
             cfg = self._voe_decode(page)
             src = str(cfg.get('source') or '')
-            if '.m3u8' in src and is_whitelisted(src):
+            if '.m3u8' in src:
                 return src, ''
             dau = str(cfg.get('direct_access_url') or '')
-            if dau.startswith('http') and is_whitelisted(dau):
+            if dau.startswith('http'):
                 return '', dau
-            if src.startswith('http') and is_whitelisted(src):
+            if src.startswith('http'):
                 return '', src
+
+            # 检查子页面中的 packer 解包
+            if 'eval(function(p,a,c,k,e' in page:
+                dec = self._unpack(page)
+                sub_hits = re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', dec)
+                if sub_hits:
+                    return sub_hits[0], ''
 
         return '', ''
 
