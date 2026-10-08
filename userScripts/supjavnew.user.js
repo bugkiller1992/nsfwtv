@@ -11,8 +11,7 @@ SupJav TVBox 爬虫 (type=3 Python spider)
         → supjav.php?c=<reversed>   (需 Referer=step1)
         → TV 线路: 明文 m3u8 (turboviplay)
           FST 线路: packer 解包 → m3u8 (premilkyway)
-          EVS/VOE等: 统一跟进 iframe / 二跳页面提取 m3u8/mp4
-          master m3u8 实测免 Referer 直连可播 → 直接给 TVBox
+        master m3u8 实测免 Referer 直连可播 → 直接给 TVBox
 """
 import re
 import json
@@ -46,7 +45,10 @@ SJ_HLS_API = PROXY_BASE + '/sj_hls?u='
 SJ_IMG_API = PROXY_BASE + '/sj_img?u='
 LK_BASE = 'https://lk1.supremejav.com/supjav.php'
 
-# 分类严格对齐站点导航栏
+# 分类严格对齐站点导航栏 (supjav.com 顶部 nav):
+#   Home / Popular / Censored / Uncensored / Amateur / Chn Sub /
+#   Reducing Mosaic / Eng Sub
+# Maker / Cast / Genre 是索引页(不是影片列表), 不做分类
 CATS = [
     ('__home', '最新'),
     ('__popular', '热门'),
@@ -58,15 +60,19 @@ CATS = [
     ('english-subtitles', '英文字幕 Eng Sub'),
 ]
 
-# 线路排序(数字越小越靠前)
+# 线路排序(数字越小越靠前): VOE 第一, TV 最后
+#   VOE 720p/1080p, 走 stream 代理转流, 分片稳定
+#   FST 480p, packer 解包 + token 绑 IP, 走代理
+#   ST  streamtape mp4 直链, 播放器自跟 302 + Range
+#   TV  1080p 但分片伪装 PNG, 需 /sj_hls 逐片剥头, 开销最大 → 垫底
 LINE_ORDER = {
     'VOE': 0,
-    'EVS': 5,
     'FST': 10,
     'ST': 20,
     'TV': 90,
 }
 
+# 站点支持 ?sort=views 排序
 SORTS = [
     {'key': 'sort', 'name': '排序',
      'value': [{'n': '最新', 'v': ''}, {'n': '最多观看', 'v': 'views'}]},
@@ -107,6 +113,7 @@ class Spider(BaseSpider):
 
     # ---------------- 网络层 ----------------
     def _get(self, url, timeout=60):
+        """requests 优先, urllib 兜底"""
         if self._sess is not None:
             try:
                 r = self._sess.get(url, timeout=timeout, verify=False)
@@ -124,11 +131,16 @@ class Spider(BaseSpider):
             return ''
 
     def _page(self, url, retries=2):
+        """站内页面: 走代理 /fs (clearance 快速通道 + FlareSolverr 兜底)
+
+        代理侧优先用缓存的 cf_clearance 直连(约 0.7s), 失效才回落过盾(约 15s)。
+        """
         api = FS_PAGE_API + urllib.parse.quote(url, safe='')
         for _ in range(max(1, retries)):
             html = self._get(api, timeout=220)
             if html and 'Just a moment' not in html and len(html) > 3000:
                 return html
+        # 兜底: 退回 Playwright 通道
         api2 = PAGE_API + urllib.parse.quote(url, safe='')
         html = self._get(api2, timeout=90)
         if html and 'Just a moment' not in html and len(html) > 3000:
@@ -136,11 +148,14 @@ class Spider(BaseSpider):
         return ''
 
     def _stream(self, url, referer='', timeout=90):
+        """第三方跳转页: 走 curl_cffi 代理并带 Referer"""
         api = STREAM_API + urllib.parse.quote(url, safe='')
         if referer:
             api += '&r=' + urllib.parse.quote(referer, safe='')
         return self._get(api, timeout=timeout)
 
+    # 播放地址解析缓存: 三跳解析(?l= → OLID 反转 → ?c=)每次要 3~6s,
+    # 用户切线路/重进详情会反复付这个成本。token 有效期远大于 90s, 可安全缓存。
     _PLAY_CACHE = {}
     _PLAY_TTL = 90
 
@@ -162,9 +177,11 @@ class Spider(BaseSpider):
                             key=lambda x: cls._PLAY_CACHE[x][0])[:20]:
                 cls._PLAY_CACHE.pop(k, None)
 
+
     # ---------------- 解析层 ----------------
     @staticmethod
     def _cards(html):
+        """列表卡片: <div class="post"> 块 → 去重列表"""
         out, seen = [], set()
         blocks = re.split(r'<div class="post">', html)[1:]
         for b in blocks:
@@ -182,6 +199,7 @@ class Spider(BaseSpider):
                 continue
             seen.add(vid)
             pic = ''
+            # 站点用 lazy-load: 真实地址在 data-original，src 是 data: 占位符
             for pat in (r'<img[^>]+data-original="([^"]+)"',
                         r'<img[^>]+data-src="([^"]+)"',
                         r'<img[^>]+src="(https?://[^"]+)"'):
@@ -191,8 +209,11 @@ class Spider(BaseSpider):
                     break
             if pic.startswith('//'):
                 pic = 'https:' + pic
+            # img.supjav.com 有 UA 门槛(无 UA 直接 403), TVBox 图片加载器
+            # 不一定带 UA → 统一走代理补 header
             if pic.startswith('http'):
                 pic = SJ_IMG_API + urllib.parse.quote(pic, safe='')
+            # 番号: 标题里的 ABC-123 / FC2PPV 1234567
             code = ''
             cm = re.search(r'\b([A-Z]{2,6}-?\d{2,6}|FC2PPV[\s-]?\d{5,8})\b', title)
             if cm:
@@ -215,6 +236,7 @@ class Spider(BaseSpider):
 
     @staticmethod
     def _unpack(text):
+        """Dean Edwards packer 解包"""
         m = re.search(r"}\('(.*?)',(\d+),(\d+),'(.*?)'\.split\('\|'\)", text, re.S)
         if not m:
             return ''
@@ -238,8 +260,10 @@ class Spider(BaseSpider):
                 table[enc(i)] = keys[i]
         return re.sub(r'\b\w+\b', lambda mm: table.get(mm.group(0), mm.group(0)), payload)
 
+    # ---------------- TVBox 接口 ----------------
     def homeContent(self, filter):
         classes = [{'type_id': cid, 'type_name': cname} for cid, cname in CATS]
+        # 只有真实 /category/ 分类支持 ?sort=views, 首页/热门不支持
         filters = {}
         for cid, _ in CATS:
             if not cid.startswith('__'):
@@ -256,6 +280,7 @@ class Spider(BaseSpider):
         ext = extend if isinstance(extend, dict) else {}
         sort = str(ext.get('sort') or '').strip()
 
+        # 站点导航里的 Home / Popular 不是 /category/ 路径
         if tid == '__home':
             url = HOST + '/' if page == 1 else HOST + '/page/%d/' % page
         elif tid == '__popular':
@@ -263,13 +288,14 @@ class Spider(BaseSpider):
                    else HOST + '/popular/page/%d/' % page)
         else:
             base = HOST + '/category/' + tid
+            # 尾斜杠形式更稳（无斜杠更容易触发 CF challenge）
             url = base + ('/' if page == 1 else '/page/%d/' % page)
             if sort:
                 url += '?sort=' + urllib.parse.quote(sort)
 
         html = self._page(url)
         items = self._cards(html)
-        if not items:
+        if not items:                      # CF 间歇拦截兜底：再试两轮
             for _ in range(2):
                 html = self._page(url, retries=2)
                 items = self._cards(html)
@@ -289,7 +315,7 @@ class Spider(BaseSpider):
         url = (HOST + '/?s=' + kw) if page == 1 else (HOST + '/page/%d/?s=%s' % (page, kw))
         html = self._page(url)
         items = self._cards(html)
-        if not items:
+        if not items:                      # CF 间歇拦截兜底
             for _ in range(2):
                 html = self._page(url, retries=2)
                 items = self._cards(html)
@@ -321,6 +347,7 @@ class Spider(BaseSpider):
         if pm:
             pic = pm.group(1)
         if not pic:
+            # 兜底: 页内任意 img.supjav.com 图片
             im = re.search(r'(https://img\.supjav\.com/[^\s"\'<>)]+\.(?:jpg|jpeg|png|webp)[^\s"\'<>)]*)',
                            html, re.I)
             if im:
@@ -335,6 +362,7 @@ class Spider(BaseSpider):
         if vm:
             views = vm.group(1).strip()
 
+        # 标签 / 演员
         tags = []
         for _kind, slug in re.findall(r'href="' + re.escape(HOST) + r'/(tag|actress)/([^"/]+)', html):
             s = slug.replace('-', ' ').strip()
@@ -345,6 +373,7 @@ class Spider(BaseSpider):
         if ym:
             year = ym.group(1)
 
+        # 线路: data-link
         links = re.findall(r'data-link="([0-9a-f]{40,})"', html)
         names = re.findall(r'data-link="[0-9a-f]{40,}"[^>]*>([^<]{1,12})<', html)
         pairs = []
@@ -352,6 +381,8 @@ class Spider(BaseSpider):
             nm = names[i].strip() if i < len(names) else ('线路%d' % (i + 1))
             pairs.append((nm, '正片$%s|%s' % (vid, lk)))
 
+        # 线路排序: VOE 优先(1080p/720p 直连稳), TV 垫底(需 PNG 剥头转流)
+        # 数字越小越靠前, 未列出的线路排中间
         def _rank(nm):
             u = nm.strip().upper()
             return LINE_ORDER.get(u, 50)
@@ -378,6 +409,16 @@ class Spider(BaseSpider):
 
     @staticmethod
     def _voe_decode(html):
+        """VOE 系(tracylocalschool.com 等)混淆解包 → 返回 config dict
+
+        混淆链路(实测): <script type="application/json"> 里的 payload
+          1. 去掉哨兵串 @$ ^^ ~@ %? *~ !! #&
+          2. rot13
+          3. base64 解码
+          4. 每字符 -3 (shift)
+          5. 整串反转
+          6. base64 解码 → JSON
+        """
         m = re.search(
             r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>',
             html or '', re.S)
@@ -410,20 +451,27 @@ class Spider(BaseSpider):
             return {}
 
     def _extract_stream(self, s2, ref):
-        """增强的播放地址抽取（已适配 EVS、VOE、FST、TV、Streamtape 等全部线路）"""
-        # 1) 直接在当前页匹配明文 m3u8
+        """从 step2 页面抽取播放地址。返回 (m3u8, direct_mp4)
+
+        supjav 四条线路各不相同:
+          TV  turboviplay  → 页内明文 m3u8
+          FST premilkyway  → packer 解包后 m3u8
+          ST  streamtape   → 二跳 embed 页, robotlink 拼接 get_video 直链
+          VOE tracylocal.. → 二跳 + application/json 六层混淆, 取 source(m3u8)
+        """
+        # 1) 明文 m3u8
         hits = re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', s2)
         if hits:
             return hits[0], ''
 
-        # 2) Dean Edwards packer 解包
+        # 2) packer 解包
         if 'eval(function(p,a,c,k,e' in s2:
             dec = self._unpack(s2)
             hits = re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', dec)
             if hits:
                 return hits[0], ''
 
-        # 3) Streamtape 线路
+        # 3) Streamtape: /e/<id> → robotlink 拼 get_video
         em = re.search(r'https?://streamtape\.com/e/([A-Za-z0-9]+)', s2)
         if em:
             eurl = 'https://streamtape.com/e/%s/' % em.group(1)
@@ -442,32 +490,11 @@ class Spider(BaseSpider):
                     link += ('&dl=1' if '?' in link else '?dl=1')
                 return '', link
 
-        # 4) 【增强逻辑】统配 EVS、VOE 等二级页面、iframe、跳转链接
+        # 4) VOE 系: 二跳后解混淆 JSON
         tgt = re.findall(r"window\.location\.href\s*=\s*'([^']+)'", s2)
-        tgt += re.findall(r'window\.location\.replace\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)', s2)
-        tgt += re.findall(r'<iframe[^>]+src=["\'](https?://[^"\']+)["\']', s2)
-        tgt += re.findall(r'https?://[a-z0-9.-]+/(?:e|embed|v|player|evs)/[a-zA-Z0-9_-]+', s2, re.I)
-        
-        seen_tgt = set()
-        for turl in tgt:
-            if turl in seen_tgt:
-                continue
-            seen_tgt.add(turl)
-            page = self._stream(turl, referer=ref)
-            if not page:
-                continue
-            
-            # 检查子页面中的 m3u8
-            sub_hits = re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', page)
-            if sub_hits:
-                return sub_hits[0], ''
-                
-            # 检查子页面中的 mp4 直链
-            mp4_hits = re.findall(r'https?://[^\s"\'<>\\]+\.mp4[^\s"\'<>\\]*', page)
-            if mp4_hits:
-                return '', mp4_hits[0]
-
-            # 检查 VOE 等混淆 JSON 结构
+        tgt += re.findall(r'https?://[a-z0-9.-]+/e/[a-z0-9]{8,}', s2)
+        if tgt:
+            page = self._stream(tgt[0], referer=ref)
             cfg = self._voe_decode(page)
             src = str(cfg.get('source') or '')
             if '.m3u8' in src:
@@ -477,13 +504,6 @@ class Spider(BaseSpider):
                 return '', dau
             if src.startswith('http'):
                 return '', src
-
-            # 检查子页面中的 packer 解包
-            if 'eval(function(p,a,c,k,e' in page:
-                dec = self._unpack(page)
-                sub_hits = re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', dec)
-                if sub_hits:
-                    return sub_hits[0], ''
 
         return '', ''
 
@@ -497,10 +517,12 @@ class Spider(BaseSpider):
         if not lk:
             return fail
 
+        # 命中解析缓存直接返回（三跳解析要 3~6s，切线路/重进详情不必重付）
         cached = self._play_cache_get(lk)
         if cached:
             return cached
 
+        # step1: supjav.php?l=<hex>  (Referer=详情页) → 页内 OLID 反转
         s1_url = LK_BASE + '?l=' + lk
         s1 = self._stream(s1_url, referer=detail)
         olid = ''
@@ -508,8 +530,9 @@ class Spider(BaseSpider):
         if om:
             olid = om.group(1)[::-1]
         else:
-            olid = lk[::-1]
+            olid = lk[::-1]   # 兜底: JS 逻辑固定为反转 data-link
 
+        # step2: supjav.php?c=<reversed>  (Referer=step1) → 各家播放页
         s2 = self._stream(LK_BASE + '?c=' + olid, referer=s1_url)
         if not s2:
             return fail
@@ -520,6 +543,13 @@ class Spider(BaseSpider):
             return fail
 
         if direct:
+            # Streamtape / VOE mp4 直链:
+            #  - get_video 链接本身不绑 IP (VPS 取也 200), 但 302 终点
+            #    tapecontent.net 绑 IP (VPS 取 403)
+            #  - 不能走 /stream 代理: fetch_stream 会把整个 mp4(1.6GB) 读进内存,
+            #    实测 502 超时
+            #  → 直接把 get_video 链接交 TVBox, 由播放器自己跟 302 并发 Range 请求,
+            #    这样最终 IP 就是 TVBox 自己的 IP, 与 302 签发方一致
             res = {
                 'parse': 0,
                 'playUrl': '',
@@ -532,6 +562,11 @@ class Spider(BaseSpider):
 
         m3u8 = m3u8.replace('\\/', '/').replace('&amp;', '&')
 
+        # 线路差异处理:
+        #  - premilkyway (FST): 分片是真 TS, token 绑 IP → 必须走代理转流,
+        #    否则 TVBox 客户端 IP 与取 token 的服务器 IP 不同, 分片 403
+        #  - turbosplayer (TV): 分片伪装成 image/png 托在 googleusercontent,
+        #    播放器不认 → 走 /sj_hls 拍平并剥 PNG 头
         low = m3u8.lower()
         if 'turbosplayer' in low or 'turboviplay' in low:
             play = SJ_HLS_API + urllib.parse.quote(m3u8, safe='')
@@ -547,3 +582,4 @@ class Spider(BaseSpider):
         }
         self._play_cache_put(lk, res)
         return res
+
