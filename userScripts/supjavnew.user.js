@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Supjav
 // @namespace    gmspider
-// @version      2026.04.08
-// @description  Supjav GMSpider (EVS, VAS, ST, VOE, LUC Ultimate Fix)
+// @version      2026.04.09
+// @description  Supjav GMSpider (EVS, VAS, ST, VOE, LUC Perfect Fix)
 // @author       Luomo
 // @match        https://supjav.com/*
 // @require      https://cdn.jsdelivr.net/npm/jquery@1.12.4/dist/jquery.min.js
@@ -19,6 +19,27 @@
         GMSpiderArgs.fArgs = ["tag"];
     }
     Object.freeze(GMSpiderArgs);
+
+    // 辅助网络请求函数（适配 GM 环境，支持同步请求与基础请求头）
+    function request(url, options = {}) {
+        try {
+            let xhr = new XMLHttpRequest();
+            let method = options.method || 'GET';
+            xhr.open(method, url, false);
+            if (options.headers) {
+                for (let h in options.headers) {
+                    xhr.setRequestHeader(h, options.headers[h]);
+                }
+            }
+            xhr.send(options.data || null);
+            if (xhr.status === 200 || xhr.status === 302 || xhr.status === 301) {
+                return xhr.responseText;
+            }
+        } catch (e) {
+            console.log("Request error: " + e);
+        }
+        return "";
+    }
 
     const GmSpider = (function () {
         function listVideos() {
@@ -112,6 +133,7 @@
                 return result;
             },
             detailContent: function (ids) {
+                // 保留你完美的标签与演员搜索格式 [a=cr:...][/a]
                 let vodActor = [], tags = [];
                 jQuery(".post-meta .cats a").each(function () {
                     const id = new URL(jQuery(this).attr("href")).pathname.replace("/zh/", "");
@@ -143,17 +165,23 @@
                     btnServers = jQuery(".video-wrap .cd-server:first .btn-server");
                 }
 
-                // 核心优化：采用 webview / 嗅探模式，将当前视频页及对应的线路索引（index）传递出去
-                // 这样客户端在点击时会直接在内置浏览器中打开该页面并模拟点击对应线路，完美支持 EVS、VAS、LUC 等复杂动态渲染线路
+                // 提取每个线路的真实加密 data-link 标识
                 btnServers.each(function (i) {
                     let serverName = jQuery(this).text().trim();
+                    let lk = jQuery(this).attr("data-link") || "";
+                    if (!lk) {
+                        let parentHtml = jQuery(this).prop('outerHTML') || "";
+                        let lkMatch = parentHtml.match(/data-link="([0-9a-f]{40,})"/);
+                        if (lkMatch) lk = lkMatch[1];
+                    }
+                    
                     vodPlayData.push({
                         from: serverName || ('线路' + (i + 1)),
                         media: [{
                             name: vodName,
-                            type: "webview",
+                            type: "xurl",
                             ext: {
-                                url: "https://supjav.com/zh/" + ids[0] + ".html#" + i
+                                url: ids[0] + "$" + lk + "$" + i
                             }
                         }]
                     });
@@ -173,19 +201,80 @@
                 return result;
             },
             playerContent: function (flag, id, vipFlags) {
-                // 通过 location.hash 自动触发网页中对应线路按钮的点击，配合 webview 完美加载 EVS、VOE、LUC 等
-                try {
-                    let link = window.location.hash.split("#").at(1);
-                    if (link !== undefined) {
-                        let btns = document.querySelectorAll(`.video-wrap .btn-server`);
-                        if (btns && btns[link]) {
-                            btns[link].dispatchEvent(new Event("click"));
+                let parts = id.split("$");
+                let vid = parts[0];
+                let lk = parts[1];
+                
+                let detailUrl = "https://supjav.com/zh/" + vid + ".html";
+                if (!lk || lk.length < 20) {
+                    return { parse: 1, url: detailUrl };
+                }
+
+                let lkBase = "https://lk1.supremejav.com/supjav.php";
+                
+                // 第一步：获取签名 OLID
+                let s1Url = lkBase + "?l=" + lk;
+                let s1 = request(s1Url, { headers: { "Referer": detailUrl } });
+                
+                let olidMatch = s1.match(/var\s+OLID\s*=\s*'([0-9a-f]{40,})'/);
+                let olid = olidMatch ? olidMatch[1].split('').reverse().join('') : lk.split('').reverse().join('');
+                
+                // 第二步：请求真实后端解密响应 (适配 EVS, VAS, LUC, VOE, ST)
+                let s2 = request(lkBase + "?c=" + olid, { headers: { "Referer": s1Url } });
+                if (!s2) {
+                    return { parse: 1, url: detailUrl };
+                }
+
+                // 1. 直接匹配 m3u8 播放源（适用于 EVS, LUC, VAS 等直出流）
+                let m3u8Match = s2.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>:]*/);
+                if (m3u8Match) {
+                    let playUrl = m3u8Match[0].replace(/\\/g, '');
+                    return { parse: 0, url: playUrl };
+                }
+
+                // 2. 匹配 Streamtape (ST)
+                let stMatch = s2.match(/https?:\/\/streamtape\.com\/e\/([A-Za-z0-9]+)/);
+                if (stMatch) {
+                    let stPage = request("https://streamtape.com/e/" + stMatch[1] + "/");
+                    let linkMatch = stPage.match(/innerHTML\s*=\s*'([^']+)'\s*\+\s*\('([^']+)'\)\.substring\((\d+)\)/);
+                    if (linkMatch) {
+                        let directUrl = linkMatch[1] + linkMatch[2].substring(parseInt(linkMatch[3]));
+                        if (directUrl.startsWith('//')) directUrl = 'https:' + directUrl;
+                        if (directUrl.indexOf('dl=') === -1) {
+                            directUrl += (directUrl.indexOf('?') !== -1 ? '&dl=1' : '?dl=1');
+                        }
+                        return { parse: 0, url: directUrl };
+                    }
+                }
+
+                // 3. 增强版：针对 EVS / VOE / LUC 等可能存在的 iframe 嵌入或重定向链接进行深度抓取
+                let frameMatch = s2.match(/src="(https?:\/\/[^"]+\/(?:e|embed|v|player)\/[^"]+)"/i) || 
+                                 s2.match(/href="([^"]+)"/i) ||
+                                 s2.match(/(https?:\/\/[a-z0-9.-]+\/(?:e|embed|v)\/[a-z0-9-_]+)/i);
+                
+                if (frameMatch) {
+                    let subUrl = frameMatch[1] || frameMatch[0];
+                    if (subUrl && subUrl.startsWith('http')) {
+                        let subPage = request(subUrl, { headers: { "Referer": s1Url } });
+                        let subM3u8 = subPage.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>:]*/);
+                        if (subM3u8) {
+                            return { parse: 0, url: subM3u8[0].replace(/\\/g, '') };
+                        }
+                        let subMp4 = subPage.match(/https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>:]*/);
+                        if (subMp4) {
+                            return { parse: 0, url: subMp4[0].replace(/\\/g, '') };
                         }
                     }
-                } catch (e) {}
-                return {
-                    type: "match"
-                };
+                }
+
+                // 4. 全局 mp4 兜底
+                let genericMp4 = s2.match(/https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>:]*/);
+                if (genericMp4) {
+                    return { parse: 0, url: genericMp4[0].replace(/\\/g, '') };
+                }
+
+                // 5. 最终防线：交给盒子自带解析器
+                return { parse: 1, url: detailUrl };
             },
             searchContent: function (key, quick, pg) {
                 const result = {
