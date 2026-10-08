@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Supjav
 // @namespace    gmspider
-// @version      2026.04.06
-// @description  Supjav GMSpider (VOE & New Players Fixed)
+// @version      2026.04.07
+// @description  Supjav GMSpider (EVS, VAS, ST, VOE, LUC Fully Supported)
 // @author       Luomo
 // @match        https://supjav.com/*
 // @require      https://cdn.jsdelivr.net/npm/jquery@1.12.4/dist/jquery.min.js
@@ -20,19 +20,19 @@
     }
     Object.freeze(GMSpiderArgs);
 
-    // 辅助网络请求函数（适配 GM 环境）
+    // 辅助网络请求函数（适配 GM 环境，支持自动重定向跟踪）
     function request(url, options = {}) {
         try {
             let xhr = new XMLHttpRequest();
             let method = options.method || 'GET';
-            xhr.open(method, url, false); // 同步请求以适应插件流程
+            xhr.open(method, url, false); // 同步请求
             if (options.headers) {
                 for (let h in options.headers) {
                     xhr.setRequestHeader(h, options.headers[h]);
                 }
             }
             xhr.send(options.data || null);
-            if (xhr.status === 200) {
+            if (xhr.status === 200 || xhr.status === 302 || xhr.status === 301) {
                 return xhr.responseText;
             }
         } catch (e) {
@@ -67,14 +67,8 @@
                     key: "sort",
                     name: "排序",
                     value: [
-                        {
-                            n: "观看数",
-                            v: "views"
-                        },
-                        {
-                            n: "更新时间",
-                            v: ""
-                        }
+                        { n: "观看数", v: "views" },
+                        { n: "更新时间", v: "" }
                     ]
                 }];
                 let result = {
@@ -93,18 +87,9 @@
                             key: "sort",
                             name: "时间",
                             value: [
-                                {
-                                    n: "本月热门",
-                                    v: "month"
-                                },
-                                {
-                                    n: "本周热门",
-                                    v: "week"
-                                },
-                                {
-                                    n: "今日热门",
-                                    v: ""
-                                }
+                                { n: "本月热门", v: "month" },
+                                { n: "本周热门", v: "week" },
+                                { n: "今日热门", v: "" }
                             ]
                         }]
                     },
@@ -148,7 +133,6 @@
                 return result;
             },
             detailContent: function (ids) {
-                // 抓取详情页时，同时获取页面中的 data-link 加密标识
                 let vodActor = [], tags = [];
                 jQuery(".post-meta .cats a").each(function () {
                     const id = new URL(jQuery(this).attr("href")).pathname.replace("/zh/", "");
@@ -180,12 +164,10 @@
                     btnServers = jQuery(".video-wrap .cd-server:first .btn-server");
                 }
 
-                // 提取每个线路服务器的真实加密 data-link
                 btnServers.each(function (i) {
                     let serverName = jQuery(this).text().trim();
                     let lk = jQuery(this).attr("data-link") || "";
                     if (!lk) {
-                        // 尝试从父级或其他地方匹配
                         let parentHtml = jQuery(this).prop('outerHTML') || "";
                         let lkMatch = parentHtml.match(/data-link="([0-9a-f]{40,})"/);
                         if (lkMatch) lk = lkMatch[1];
@@ -195,7 +177,7 @@
                         from: serverName || ('线路' + (i + 1)),
                         media: [{
                             name: vodName,
-                            type: "xurl", // 改用直连/嗅探类型，交由 playerContent 处理解密
+                            type: "xurl",
                             ext: {
                                 url: ids[0] + "$" + lk + "$" + i
                             }
@@ -217,39 +199,38 @@
                 return result;
             },
             playerContent: function (flag, id, vipFlags) {
-                // 解析扩展参数：id 格式为 "vid$lk$index"
                 let parts = id.split("$");
                 let vid = parts[0];
                 let lk = parts[1];
                 
                 if (!lk || lk.length < 20) {
-                    return { parse: 1, url: window.location.href };
+                    return { parse: 1, url: "https://supjav.com/zh/" + vid + ".html" };
                 }
 
                 let detailUrl = "https://supjav.com/zh/" + vid + ".html";
                 let lkBase = "https://lk1.supremejav.com/supjav.php";
                 
-                // 第一步请求：获取 OLID 签名
+                // 第一步：请求获取签名
                 let s1Url = lkBase + "?l=" + lk;
                 let s1 = request(s1Url, { headers: { "Referer": detailUrl } });
                 
                 let olidMatch = s1.match(/var\s+OLID\s*=\s*'([0-9a-f]{40,})'/);
                 let olid = olidMatch ? olidMatch[1].split('').reverse().join('') : lk.split('').reverse().join('');
                 
-                // 第二步请求：获取真实播放载荷
+                // 第二步：请求真实解密数据
                 let s2 = request(lkBase + "?c=" + olid, { headers: { "Referer": s1Url } });
                 if (!s2) {
                     return { parse: 1, url: detailUrl };
                 }
 
-                // 匹配 m3u8 地址
+                // 1. 通用 m3u8 匹配（适用于 EVS, LUC, VAS 等直出 m3u8 的线路）
                 let m3u8Match = s2.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>:]*/);
                 if (m3u8Match) {
                     let playUrl = m3u8Match[0].replace(/\\/g, '');
                     return { parse: 0, url: playUrl };
                 }
 
-                // 匹配 Streamtape 直链
+                // 2. Streamtape (ST) 线路解析
                 let stMatch = s2.match(/https?:\/\/streamtape\.com\/e\/([A-Za-z0-9]+)/);
                 if (stMatch) {
                     let stPage = request("https://streamtape.com/e/" + stMatch[1] + "/");
@@ -264,17 +245,36 @@
                     }
                 }
 
-                // VOE 或其他跳转兜底
-                let locMatch = s2.match(/window\.location\.href\s*=\s*'([^']+)'/) || s2.match(/https?:\/\/[a-z0-9.-]+\/e\/[a-z0-9]{8,}/);
-                if (locMatch) {
-                    let voePage = request(locMatch[1] || locMatch[0], { headers: { "Referer": s1Url } });
-                    let srcMatch = voePage.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>:]*/);
-                    if (srcMatch) {
-                        return { parse: 0, url: srcMatch[0].replace(/\\/g, '') };
+                // 3. VOE / LUC / EVS 动态跳转重定向解析
+                let locMatches = [
+                    ...s2.matchAll(/window\.location\.href\s*=\s*'([^']+)'/g),
+                    ...s2.matchAll(/https?:\/\/[a-z0-9.-]+\/(?:e|embed|v)\/[a-z0-9-_]+/gi)
+                ];
+                
+                for (let match of locMatches) {
+                    let targetUrl = match[1] || match[0];
+                    if (targetUrl && targetUrl.startsWith('http')) {
+                        let subPage = request(targetUrl, { headers: { "Referer": s1Url } });
+                        // 尝试在跳转后的页面中捞 m3u8
+                        let subM3u8 = subPage.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>:]*/);
+                        if (subM3u8) {
+                            return { parse: 0, url: subM3u8[0].replace(/\\/g, '') };
+                        }
+                        // 尝试捞 mp4 直链
+                        let subMp4 = subPage.match(/https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>:]*/);
+                        if (subMp4) {
+                            return { parse: 0, url: subMp4[0].replace(/\\/g, '') };
+                        }
                     }
                 }
 
-                // 最终默认兜底交由内置解析
+                // 4. 通用兜底：如果文本里藏了任何 mp4 或视频链接
+                let genericMp4 = s2.match(/https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>:]*/);
+                if (genericMp4) {
+                    return { parse: 0, url: genericMp4[0].replace(/\\/g, '') };
+                }
+
+                // 最终如果均无法自主解析，交由客户端内置 WebView/解析器兜底
                 return { parse: 1, url: detailUrl };
             },
             searchContent: function (key, quick, pg) {
