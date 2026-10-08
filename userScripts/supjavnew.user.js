@@ -1,14 +1,23 @@
 // ==UserScript==
 // @name         Supjav
 // @namespace    gmspider
-// @version      2026.10.07
-// @description  Supjav GMSpider（兼容新版播放器 + 过滤广告）
+// @version      2026.10.07.3
+// @description  Supjav GMSpider（兼容新版播放器 + 屏蔽广告/弹窗视频）
 // @author       Luomo
 // @match        https://supjav.com/*
 // @require      https://cdn.jsdelivr.net/npm/jquery@1.12.4/dist/jquery.min.js
 // @grant        unsafeWindow
+// @run-at       document-start
 // ==/UserScript==
 (function () {
+    /* ============================ 配置 ============================ */
+    // 播放器真实入口：supjav.php?c=<反转的 data-link> 会 302 到各线路(TV/ST/FST/VOE...)的播放页
+    // supjav.php?l=<data-link> 是带前贴片广告的中间页，默认跳过
+    const PLAYER_BASE = "https://lk1.supremejav.com/";
+    // "direct"：直接进真实播放页（跳过前贴片广告，推荐）
+    // "preroll"：走网站原流程的中间页（仅当 direct 模式黑屏/403 时再改成这个）
+    const PLAY_MODE = "direct";
+
     const GMSpiderArgs = {};
     if (typeof GmSpiderInject !== 'undefined') {
         let args = JSON.parse(GmSpiderInject.GetSpiderArgs());
@@ -20,26 +29,201 @@
     }
     Object.freeze(GMSpiderArgs);
 
-    const AD_CLASS_RE = /(^|\s)(ad|ads|adv|advert|banner|sponsor|sponsored|promo)(\s|$|-|_)/i;
+    const AD_CLASS_RE = /(^|[\s_-])(ad|ads|adv|advert|adsbox|banner|sponsor|sponsored|promo|popup|popunder)([\s_-]|$)/i;
     const AD_TEXT_RE = /(广告|推广|赞助|下载|download|sponsor|\bads?\b|vip|app)/i;
     const SITE_HOST_RE = /(^|\.)supjav\.com$/i;
+    const PLAYER_HOST_RE = /(^|\.)supremejav\.com$/i;
+    const W = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
 
-    const GmSpider = (function () {
-        function safeUrl(href) {
+    function safeUrl(href, base) {
+        try {
+            return new URL(href, base || location.href);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function reverseStr(s) {
+        return String(s).split("").reverse().join("");
+    }
+
+    /* ======================= 广告/弹窗屏蔽 ======================= */
+    const AdGuard = (function () {
+        let installed = false;
+
+        // 本页（supjav 主站）本身不存在正片 <video>，正片都在播放器 iframe 里，
+        // 所以主页面上的 video/audio 一律视为广告
+        function killMedia(el) {
             try {
-                return new URL(href, location.origin);
+                el.pause && el.pause();
+                el.muted = true;
+                el.removeAttribute("src");
+                el.querySelectorAll && el.querySelectorAll("source").forEach(s => s.remove());
+                el.load && el.load();
             } catch (e) {
-                return null;
+            }
+            el.remove();
+        }
+
+        function isOurPlayer(el) {
+            return el && el.getAttribute && el.getAttribute("data-gm-player") === "1";
+        }
+
+        function isAdBox(el) {
+            if (!el || el.nodeType !== 1) return false;
+            if (el.matches && el.matches(".post, .posts, .video-wrap, .post-meta, .pagination, .categorys, body, html")) return false;
+            const cls = typeof el.className === "string" ? el.className : "";
+            if (AD_CLASS_RE.test(cls) || AD_CLASS_RE.test(el.id || "")) return true;
+            // 全屏/悬浮遮罩层（弹窗广告常用）
+            try {
+                const st = getComputedStyle(el);
+                if ((st.position === "fixed" || st.position === "sticky") && parseInt(st.zIndex, 10) >= 999 &&
+                    (el.querySelector("a[target=_blank], iframe, video") || el.tagName === "A")) {
+                    return true;
+                }
+            } catch (e) {
+            }
+            return false;
+        }
+
+        function handleNode(node) {
+            if (!node || node.nodeType !== 1) return;
+            const tag = node.tagName;
+            if (tag === "VIDEO" || tag === "AUDIO") {
+                killMedia(node);
+                return;
+            }
+            if (tag === "IFRAME" || tag === "EMBED" || tag === "OBJECT") {
+                if (!isOurPlayer(node)) node.remove();
+                return;
+            }
+            if (isAdBox(node) && !node.querySelector("[data-gm-player='1']")) {
+                node.remove();
+                return;
+            }
+            if (node.querySelectorAll) {
+                node.querySelectorAll("video, audio").forEach(killMedia);
+                node.querySelectorAll("iframe, embed, object").forEach(f => {
+                    if (!isOurPlayer(f)) f.remove();
+                });
             }
         }
 
+        function clean() {
+            if (!document.documentElement) return;
+            handleNode(document.documentElement);
+            document.querySelectorAll("div, section, aside, a, ins").forEach(el => {
+                if (el.isConnected && isAdBox(el) && !el.querySelector("[data-gm-player='1']")) el.remove();
+            });
+        }
+
+        function install() {
+            if (installed) return;
+            installed = true;
+
+            // 1. 禁止弹窗/新窗口（WebView 会把 window.open 直接在当前页打开广告）
+            const fakeWin = function () {
+                return {
+                    closed: false, close() {
+                    }, focus() {
+                    }, blur() {
+                    }, postMessage() {
+                    },
+                    location: {href: "", replace() {
+                        }, assign() {
+                        }},
+                    document: {write() {
+                        }, close() {
+                        }, open() {
+                        }}
+                };
+            };
+            try {
+                W.open = fakeWin;
+                window.open = fakeWin;
+            } catch (e) {
+            }
+
+            // 2. 拦截外站链接/弹窗点击（捕获阶段，优先于网站自己的 popunder 脚本）
+            window.addEventListener("click", function (e) {
+                const a = e.target && e.target.closest ? e.target.closest("a") : null;
+                if (a && a.href) {
+                    const u = safeUrl(a.href);
+                    if (a.target === "_blank" || (u && !SITE_HOST_RE.test(u.hostname))) {
+                        e.preventDefault();
+                        e.stopImmediatePropagation();
+                    }
+                }
+            }, true);
+
+            // 3. 主页面上的任何媒体一律禁止播放/加载
+            try {
+                const proto = HTMLMediaElement.prototype;
+                proto.play = function () {
+                    killMedia(this);
+                    return Promise.reject(new DOMException("blocked by gmspider", "NotAllowedError"));
+                };
+                proto.load = function () {
+                };
+                const srcDesc = Object.getOwnPropertyDescriptor(proto, "src");
+                if (srcDesc && srcDesc.configurable) {
+                    Object.defineProperty(proto, "src", {
+                        configurable: true,
+                        get: function () {
+                            return srcDesc.get.call(this);
+                        },
+                        set: function () { /* 拦截 */
+                        }
+                    });
+                }
+            } catch (e) {
+            }
+
+            // 4. CSP：主页面禁止加载任何音视频（正片在播放器 iframe 里，不受影响）
+            let cspAdded = false;
+
+            function addCsp() {
+                if (cspAdded) return;
+                const parent = document.head || document.documentElement;
+                if (!parent) return;
+                const meta = document.createElement("meta");
+                meta.httpEquiv = "Content-Security-Policy";
+                meta.content = "media-src 'none'";
+                parent.insertBefore(meta, parent.firstChild);
+                cspAdded = true;
+            }
+
+            addCsp();
+
+            // 5. 持续监听后插入的广告节点
+            const mo = new MutationObserver(function (list) {
+                if (!cspAdded) addCsp();
+                for (const m of list) {
+                    m.addedNodes && m.addedNodes.forEach(handleNode);
+                    if (m.type === "attributes" && m.target.tagName === "IFRAME" && !isOurPlayer(m.target)) {
+                        m.target.remove();
+                    }
+                }
+            });
+            // document-start 时 documentElement 可能还不存在，监听 document 本身
+            mo.observe(document, {childList: true, subtree: true, attributes: true, attributeFilter: ["src"]});
+
+            if (document.documentElement) clean();
+        }
+
+        return {install, clean};
+    })();
+
+    // 尽早安装（不等 DOM ready），避免广告视频在 playerContent 之前就被嗅探到
+    AdGuard.install();
+
+    /* ============================ 爬虫 ============================ */
+    const GmSpider = (function () {
         function isAdNode($el) {
-            // 自身或祖先带广告类名/ID
             let node = $el.get(0);
             while (node && node !== document.body) {
                 const cls = (node.className && typeof node.className === "string") ? node.className : "";
-                const id = node.id || "";
-                if (AD_CLASS_RE.test(cls) || AD_CLASS_RE.test(id)) return true;
+                if (AD_CLASS_RE.test(cls) || AD_CLASS_RE.test(node.id || "")) return true;
                 node = node.parentElement;
             }
             return false;
@@ -47,12 +231,9 @@
 
         // 只保留指向本站正常影片页的条目
         function isValidVideoUrl(url) {
-            if (!url) return false;
-            if (!SITE_HOST_RE.test(url.hostname)) return false;
+            if (!url || !SITE_HOST_RE.test(url.hostname)) return false;
             const parts = url.pathname.split('/').filter(Boolean);
-            // 形如 /zh/123456.html 或 /123456.html
-            const last = parts[parts.length - 1] || "";
-            return /^\d+\.html$/.test(last);
+            return /^\d+\.html$/.test(parts[parts.length - 1] || "");
         }
 
         function getVideoId(url) {
@@ -60,11 +241,15 @@
             return parts[parts.length - 1];
         }
 
+        function formatImgUrl(url) {
+            if (!url) return "";
+            if (url.startsWith("//")) return "https:" + url;
+            return url;
+        }
+
         function getImg($el) {
             const $img = $el.find("img").first();
-            return formatImgUrl(
-                $img.attr("data-original") || $img.attr("data-src") || $img.attr("data-lazy-src") || $img.attr("src") || ""
-            );
+            return formatImgUrl($img.attr("data-original") || $img.attr("data-src") || $img.attr("data-lazy-src") || $img.attr("src") || "");
         }
 
         function listVideos() {
@@ -92,17 +277,15 @@
         }
 
         function getPageCount() {
-            const $li = jQuery(".pagination li").not(".next-page");
-            if ($li.length === 0) return 1;
             let max = 1;
-            $li.each(function () {
+            jQuery(".pagination li").not(".next-page").each(function () {
                 const n = parseInt(jQuery(this).text().trim(), 10);
                 if (!isNaN(n) && n > max) max = n;
             });
             return max;
         }
 
-        // 线路按钮（与 playerContent 使用同一选择器，保证下标一致）
+        // 线路按钮（detail 与 player 用同一选择器，保证下标一致）
         function getServerButtons() {
             if (jQuery(".video-wrap .cd-server").length > 0) {
                 return jQuery(".video-wrap .cd-server:first .btn-server");
@@ -110,23 +293,58 @@
             return jQuery(".video-wrap .btn-server");
         }
 
-        function isAdServer($btn) {
+        // 真实线路必须带 data-link；没有 data-link 或文字/链接像广告的都排除
+        function isRealServer($btn) {
+            const link = ($btn.attr("data-link") || "").trim();
+            if (!link) return false;
             const text = $btn.text().trim();
-            if (!text) return true;
-            if (AD_TEXT_RE.test(text)) return true;
-            if (isAdNode($btn)) return true;
+            if (!text || AD_TEXT_RE.test(text)) return false;
+            if (isAdNode($btn)) return false;
             const href = $btn.attr("href");
             if (href && !href.startsWith("#") && !href.startsWith("javascript")) {
                 const u = safeUrl(href);
-                if (u && !SITE_HOST_RE.test(u.hostname)) return true;
+                if (u && !SITE_HOST_RE.test(u.hostname)) return false;
             }
-            return false;
+            return true;
         }
 
-        function formatImgUrl(url) {
-            if (!url) return "";
-            if (url.startsWith("//")) return "https:" + url;
-            return url;
+        // 播放参数放在 query 里（不用 #，因为 # 是 vod_play_url 的剧集分隔符）
+        function buildPlayPageUrl(vodId, idx, link) {
+            return "https://supjav.com/zh/" + vodId + "?gmsrv=" + idx + "&gmlink=" + encodeURIComponent(link);
+        }
+
+        function readPlayParams(id) {
+            const p = {idx: NaN, link: ""};
+            const sources = [location.href];
+            if (typeof id === "string") sources.push(id);
+            for (const s of sources) {
+                const u = safeUrl(s);
+                if (!u) continue;
+                if (u.searchParams.has("gmsrv")) {
+                    p.idx = parseInt(u.searchParams.get("gmsrv"), 10);
+                    p.link = u.searchParams.get("gmlink") || "";
+                    return p;
+                }
+                // 兼容旧版 #序号
+                const h = u.hash.replace("#", "");
+                if (/^\d+$/.test(h)) {
+                    p.idx = parseInt(h, 10);
+                    return p;
+                }
+            }
+            return p;
+        }
+
+        function getPlayerBox() {
+            let box = document.querySelector("#dz_video, #player, .video-wrap .player, .video-wrap .video, .video-wrap .embed-responsive");
+            if (!box) {
+                box = document.createElement("div");
+                const wrap = document.querySelector(".video-wrap") || document.body;
+                wrap.insertBefore(box, wrap.firstChild);
+            }
+            box.innerHTML = "";
+            box.style.cssText += ";position:relative;width:100%;min-height:240px;";
+            return box;
         }
 
         return {
@@ -173,13 +391,7 @@
             },
 
             categoryContent: function (tid, pg, filter, extend) {
-                let result = {
-                    page: parseInt(pg, 10) || 1,
-                    pagecount: 1,
-                    limit: 0,
-                    total: 0,
-                    list: []
-                };
+                let result = {page: parseInt(pg, 10) || 1, pagecount: 1, limit: 0, total: 0, list: []};
                 if (tid === "tag") {
                     jQuery(".categorys .child").each(function () {
                         const $c = jQuery(this);
@@ -209,7 +421,11 @@
             },
 
             detailContent: function (ids) {
-                jQuery("#vserver").click();
+                // 线路按钮在静态 HTML 里就有，不再点击 #vserver（点击会触发弹窗广告）
+                if (getServerButtons().length === 0) {
+                    const v = document.querySelector("#vserver");
+                    v && v.dispatchEvent(new Event("click"));
+                }
                 let vodActor = [], tags = [];
                 jQuery(".post-meta .cats a").each(function () {
                     const u = safeUrl(jQuery(this).attr("href"));
@@ -238,25 +454,21 @@
                     }
                 }
 
-                // 旧格式（vod_play_data）+ 新格式（vod_play_from / vod_play_url）
-                let vodPlayData = [];
-                let playFrom = [];
-                let playUrl = [];
+                let vodPlayData = [], playFrom = [], playUrl = [];
+                const seenLink = {};
                 getServerButtons().each(function (i) {
                     const $btn = jQuery(this);
-                    if (isAdServer($btn)) return;   // 跳过广告线路
-                    const from = $btn.text().trim();
-                    // i 为原始 DOM 下标，playerContent 依赖它点击对应按钮
-                    const pageUrl = "https://supjav.com/zh/" + ids[0] + "#" + i;
+                    if (!isRealServer($btn)) return;
+                    const link = $btn.attr("data-link").trim();
+                    if (seenLink[link]) return;
+                    seenLink[link] = true;
+                    const from = $btn.text().trim().replace(/\$|#/g, "");
+                    const pageUrl = buildPlayPageUrl(ids[0], i, link);
                     vodPlayData.push({
                         from: from,
-                        media: [{
-                            name: vodName,
-                            type: "webview",
-                            ext: {url: pageUrl}
-                        }]
+                        media: [{name: vodName, type: "webview", ext: {url: pageUrl}}]
                     });
-                    playFrom.push(from.replace(/\$|#/g, ""));
+                    playFrom.push(from);
                     playUrl.push(vodName.replace(/\$|#/g, "") + "$" + pageUrl);
                 });
 
@@ -276,39 +488,49 @@
             },
 
             playerContent: function (flag, id, vipFlags) {
-                // 兼容 hash 来自 window.location 或直接传入的 id
-                let idx = window.location.hash.split("#").at(1);
-                if ((idx === undefined || idx === "") && typeof id === "string" && id.includes("#")) {
-                    idx = id.split("#").at(-1);
-                }
-                idx = parseInt(idx, 10) || 0;
-                const btns = getServerButtons().get();
-                const btn = btns[idx] || btns.find(b => !isAdServer(jQuery(b)));
-                if (btn) btn.dispatchEvent(new Event("click", {bubbles: true}));
-                return {
-                    type: "match",
-                    parse: 1,
-                    jx: 0,
-                    url: window.location.href,
-                    header: {
-                        "Referer": "https://supjav.com/",
-                        "User-Agent": navigator.userAgent
+                const p = readPlayParams(id);
+                let link = p.link;
+                if (!link) {
+                    const btns = getServerButtons();
+                    let $btn = isNaN(p.idx) ? jQuery() : btns.eq(p.idx);
+                    if (!$btn.length || !isRealServer($btn)) {
+                        $btn = btns.filter(function () {
+                            return isRealServer(jQuery(this));
+                        }).first();
                     }
-                };
+                    link = ($btn.attr("data-link") || "").trim();
+                }
+                if (!link) return {type: "match"};
+
+                // 不再点击网站按钮（会触发 popunder + 前贴片广告页），直接嵌入真实播放页
+                AdGuard.clean();
+                const src = PLAY_MODE === "direct"
+                    ? PLAYER_BASE + "supjav.php?c=" + encodeURIComponent(reverseStr(link))
+                    : PLAYER_BASE + "supjav.php?l=" + encodeURIComponent(link) + "&bg=undefined";
+                const iframe = document.createElement("iframe");
+                iframe.setAttribute("data-gm-player", "1");
+                iframe.setAttribute("allow", "autoplay; fullscreen; encrypted-media");
+                iframe.setAttribute("allowfullscreen", "true");
+                iframe.setAttribute("referrerpolicy", "unsafe-url");
+                iframe.style.cssText = "position:absolute;inset:0;width:100%;height:100%;border:0;";
+                iframe.src = src;
+                getPlayerBox().appendChild(iframe);
+
+                return {type: "match"};
             },
 
             searchContent: function (key, quick, pg) {
-                const result = {
+                return {
                     page: parseInt(pg, 10) || 1,
                     pagecount: getPageCount(),
                     list: listVideos()
                 };
-                return result;
             }
         };
     })();
 
     jQuery(function () {
+        AdGuard.clean();
         let result;
         try {
             result = GmSpider[GMSpiderArgs.fName](...GMSpiderArgs.fArgs);
@@ -322,3 +544,4 @@
         }
     });
 })();
+
