@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Supjav
 // @namespace    gmspider
-// @version      2026.10.08.1
+// @version      2026.10.08.2
 // @description  Supjav GMSpider（兼容新版播放器 + 屏蔽广告/弹窗视频）
 // @author       Luomo
 // @match        https://supjav.com/*
@@ -24,9 +24,10 @@
     // "preroll"：走网站原流程的中间页（仅当 direct 模式黑屏/403 时再改成这个）
     const PLAY_MODE = "direct";
     // 播放页打开方式：
-    // "navigate"：直接跳转到播放器页面，不再加载 supjav 页面（最快，推荐）
-    // "iframe"：等 supjav 页面加载完，在页面里嵌入播放器（navigate 不出画面时再改成这个）
-    const PLAYER_OPEN = "navigate";
+    // "inplace"：网址不变，立即把 supjav 页面替换成只有播放器的空白页（快，EVS / VAS 都能用，推荐）
+    // "navigate"：直接跳转到播放器页面（VAS 最快；EVS 会提示“播放地址加载失败”）
+    // "iframe"：等 supjav 页面加载完，再在页面里嵌入播放器（最慢，最保守）
+    const PLAYER_OPEN = "inplace";
     // 等待页面的最长时间（毫秒），超时后用已有内容返回结果，避免 App 一直转圈
     const MAX_WAIT_MS = 20000;
 
@@ -670,16 +671,46 @@
     }
 
     // 播放快速通道：线路地址已经写在播放链接里，不需要等 supjav 页面加载
+    function openPlayerInPlace(src) {
+        const esc = src.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+        const html = '<!DOCTYPE html><html><head><meta charset="utf-8">' +
+            '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+            '<meta name="referrer" content="unsafe-url">' +
+            '<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}' +
+            'iframe{position:fixed;left:0;top:0;width:100%;height:100%;border:0}</style></head>' +
+            '<body><iframe data-gm-player="1" allow="autoplay; fullscreen; encrypted-media" allowfullscreen ' +
+            'referrerpolicy="unsafe-url" src="' + esc + '"></iframe></body></html>';
+        try {
+            // 中止 supjav 页面剩余部分的解析和加载，换成只有播放器的页面（网址不变）
+            document.open();
+            document.write(html);
+            document.close();
+        } catch (e) {
+            console.error(e);
+        }
+        return !!document.querySelector("iframe[data-gm-player='1']");
+    }
+
+    let fastTried = false;
+
     function tryFastPlayer() {
-        if (GMSpiderArgs.fName !== "playerContent" || PLAYER_OPEN !== "navigate") return false;
+        if (fastTried || GMSpiderArgs.fName !== "playerContent" || PLAYER_OPEN === "iframe") return false;
+        fastTried = true;
         const link = getPlayLinkFromUrl();
         if (!link) return false;
-        sendResult({type: "match"});
-        try {
-            window.stop();
-        } catch (e) {
+        const src = playerUrl(link);
+        if (PLAYER_OPEN === "navigate") {
+            sendResult({type: "match"});
+            try {
+                window.stop();
+            } catch (e) {
+            }
+            location.replace(src);
+            return true;
         }
-        location.replace(playerUrl(link));
+        // inplace：替换失败（个别 WebView 不允许）时返回 false，退回到 iframe 方式
+        if (!openPlayerInPlace(src)) return false;
+        sendResult({type: "match"});
         return true;
     }
 
