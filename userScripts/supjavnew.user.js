@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Supjav
 // @namespace    gmspider
-// @version      2026.10.07.4
+// @version      2026.10.08.1
 // @description  Supjav GMSpider（兼容新版播放器 + 屏蔽广告/弹窗视频）
 // @author       Luomo
 // @match        https://supjav.com/*
@@ -10,6 +10,12 @@
 // @run-at       document-start
 // ==/UserScript==
 (function () {
+    // 只在 supjav 顶层页面运行（不在 Cloudflare 验证 iframe、广告 iframe 里运行）
+    try {
+        if (window.top !== window.self || !/(^|\.)supjav\.com$/i.test(location.hostname)) return;
+    } catch (e) {
+        return;
+    }
     /* ============================ 配置 ============================ */
     // 播放器真实入口：supjav.php?c=<反转的 data-link> 会 302 到各线路(TV/ST/FST/VOE...)的播放页
     // supjav.php?l=<data-link> 是带前贴片广告的中间页，默认跳过
@@ -17,6 +23,12 @@
     // "direct"：直接进真实播放页（跳过前贴片广告，推荐）
     // "preroll"：走网站原流程的中间页（仅当 direct 模式黑屏/403 时再改成这个）
     const PLAY_MODE = "direct";
+    // 播放页打开方式：
+    // "navigate"：直接跳转到播放器页面，不再加载 supjav 页面（最快，推荐）
+    // "iframe"：等 supjav 页面加载完，在页面里嵌入播放器（navigate 不出画面时再改成这个）
+    const PLAYER_OPEN = "navigate";
+    // 等待页面的最长时间（毫秒），超时后用已有内容返回结果，避免 App 一直转圈
+    const MAX_WAIT_MS = 20000;
 
     const GMSpiderArgs = {};
     if (typeof GmSpiderInject !== 'undefined') {
@@ -33,6 +45,8 @@
     const AD_TEXT_RE = /(广告|推广|赞助|下载|download|sponsor|\bads?\b|vip|app)/i;
     const SITE_HOST_RE = /(^|\.)supjav\.com$/i;
     const PLAYER_HOST_RE = /(^|\.)supremejav\.com$/i;
+    // Cloudflare 人机验证要用到的 iframe / 脚本，必须放行，否则验证永远过不去
+    const CF_HOST_RE = /(^|\.)cloudflare\.com$/i;
     const W = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
 
     function safeUrl(href, base) {
@@ -67,7 +81,12 @@
         }
 
         function isOurPlayer(el) {
-            return el && el.getAttribute && el.getAttribute("data-gm-player") === "1";
+            if (!el || !el.getAttribute) return false;
+            if (el.getAttribute("data-gm-player") === "1") return true;
+            // 放行 Cloudflare 验证 iframe（challenges.cloudflare.com）
+            const src = el.getAttribute("src") || "";
+            const u = src ? safeUrl(src) : null;
+            return !!(u && CF_HOST_RE.test(u.hostname));
         }
 
         // 轻量判断（只看 class/id，不触发样式计算，解析期间可以对每个节点调用）
@@ -594,9 +613,7 @@
                 // 先清掉页面上的广告并冻结主页面（停止所有加载和网站定时器），再插入播放器
                 AdGuard.clean();
                 AdGuard.freeze(false);
-                const src = PLAY_MODE === "direct"
-                    ? PLAYER_BASE + "supjav.php?c=" + encodeURIComponent(reverseStr(link))
-                    : PLAYER_BASE + "supjav.php?l=" + encodeURIComponent(link) + "&bg=undefined";
+                const src = playerUrl(link);
                 const iframe = document.createElement("iframe");
                 iframe.setAttribute("data-gm-player", "1");
                 iframe.setAttribute("allow", "autoplay; fullscreen; encrypted-media");
@@ -619,21 +636,111 @@
         };
     })();
 
-    jQuery(function () {
-        const isPlayer = GMSpiderArgs.fName === "playerContent";
-        let result;
-        try {
-            result = GmSpider[GMSpiderArgs.fName](...GMSpiderArgs.fArgs);
-        } catch (e) {
-            console.error(e);
-            result = {list: [], error: String(e)};
-        }
+    /* ============================ 调度 ============================ */
+    function isChallengePage() {
+        if (/^\/cdn-cgi\//.test(location.pathname)) return true;
+        const t = document.title || "";
+        if (/just a moment|attention required|请稍候|請稍候|checking your browser/i.test(t)) return true;
+        return !!document.querySelector("#challenge-form, #challenge-running, #cf-challenge-running, .cf-turnstile, #cf-wrapper, script[src*='challenge-platform']");
+    }
+
+    let done = false;
+
+    function sendResult(result) {
+        if (done) return;
+        done = true;
         console.log(result);
         if (typeof GmSpiderInject !== 'undefined') {
             GmSpiderInject.SetSpiderResult(JSON.stringify(result));
         }
+    }
+
+    function getPlayLinkFromUrl() {
+        for (const s of [location.href, String((GMSpiderArgs.fArgs || [])[1] || "")]) {
+            const u = safeUrl(s);
+            if (u && u.searchParams.get("gmlink")) return u.searchParams.get("gmlink");
+        }
+        return "";
+    }
+
+    function playerUrl(link) {
+        return PLAY_MODE === "direct"
+            ? PLAYER_BASE + "supjav.php?c=" + encodeURIComponent(reverseStr(link))
+            : PLAYER_BASE + "supjav.php?l=" + encodeURIComponent(link) + "&bg=undefined";
+    }
+
+    // 播放快速通道：线路地址已经写在播放链接里，不需要等 supjav 页面加载
+    function tryFastPlayer() {
+        if (GMSpiderArgs.fName !== "playerContent" || PLAYER_OPEN !== "navigate") return false;
+        const link = getPlayLinkFromUrl();
+        if (!link) return false;
+        sendResult({type: "match"});
+        try {
+            window.stop();
+        } catch (e) {
+        }
+        location.replace(playerUrl(link));
+        return true;
+    }
+
+    // 详情页数据（标题 + 线路按钮 + 标签）在 HTML 里出现后就可以提前取，不必等整页加载完
+    function detailReady() {
+        return !!(document.querySelector(".post-meta .img") &&
+            document.querySelector(".video-wrap .btn-server") &&
+            document.querySelector(".post-meta .tags"));
+    }
+
+    function hasJq() {
+        return typeof jQuery === "function" && jQuery.fn && jQuery.fn.jquery;
+    }
+
+    function run(force) {
+        if (done) return;
+        if (isChallengePage()) return;            // 验证页：不返回空结果，等验证通过后页面会自动刷新
+        if (tryFastPlayer()) return;
+        if (!hasJq()) return;
+        const fName = GMSpiderArgs.fName;
+        const domDone = document.readyState !== "loading";
+        if (!force && !domDone && !(fName === "detailContent" && detailReady())) return;
+
+        const isPlayer = fName === "playerContent";
+        let result;
+        try {
+            result = GmSpider[fName](...GMSpiderArgs.fArgs);
+        } catch (e) {
+            console.error(e);
+            result = {list: [], error: String(e)};
+        }
+        // 页面还没加载完、却什么都没取到：多半是页面不完整，继续等，不返回空结果
+        if (!force && !domDone && !isPlayer && result && Array.isArray(result.list) && result.list.length === 0) return;
+        sendResult(result);
         // 列表/搜索/详情拿到数据后立即冻结页面，避免后台广告继续加载、拖慢 App
         if (!isPlayer) AdGuard.freeze(true);
-    });
+    }
+
+    // 1. 立即尝试（播放快速通道）
+    run(false);
+    if (!done) {
+        // 2. DOM 解析完成
+        document.addEventListener("DOMContentLoaded", function () {
+            run(false);
+        });
+        // 3. 解析过程中轮询（详情页提前返回；验证通过后继续）
+        const started = Date.now();
+        const timer = setInterval(function () {
+            if (done) return clearInterval(timer);
+            const overtime = Date.now() - started > MAX_WAIT_MS;
+            if (overtime && !isChallengePage()) {
+                clearInterval(timer);
+                run(true);
+            } else {
+                run(false);
+            }
+        }, 250);
+        // 4. 页面完全加载
+        window.addEventListener("load", function () {
+            run(true);
+        });
+    }
 })();
 
