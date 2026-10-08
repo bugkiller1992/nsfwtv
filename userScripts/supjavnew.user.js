@@ -3,9 +3,8 @@
 """
 SupJav TVBox 爬虫 (type=3 Python spider)
 ================================================================
-修复说明：对 _extract_stream 实施极度严格的白名单校验，强制只提取
-官方指定视频 CDN/播放器域名的流（turboviplay, premilkyway, streamtape, voe），
-彻底杜绝误抓广告弹窗内嵌视频。
+修复说明：修正了 _extract_stream 盲目取 hits[0] 导致误抓广告 m3u8 的严重漏洞。
+现在对所有提取出的 m3u8 链接实施严格的白名单特征过滤。
 """
 import re
 import json
@@ -398,11 +397,7 @@ class Spider(BaseSpider):
             return {}
 
     def _extract_stream(self, s2, ref):
-        """【绝对安全白名单过滤】
-        只允许匹配包含官方特定播放器域名的 m3u8 或 mp4，
-        任何不在此白名单内的 URL 都会被直接丢弃，彻底根除广告视频。
-        """
-        # 合法的官方视频 CDN/播放源域名白名单关键字
+        """【已修复】引入白名单机制过滤广告 m3u8，绝不盲目取第一个匹配项"""
         valid_domains = [
             'turboviplay.com', 'turbosplayer.com', 'premilkyway.com',
             'streamtape.com', 'voe.sx', 'tracylocalschool.com', 'vidsrc',
@@ -411,20 +406,19 @@ class Spider(BaseSpider):
 
         def is_whitelisted(url):
             u_low = url.lower()
-            for d in valid_domains:
-                if d in u_low:
-                    return True
-            return False
+            return any(d in u_low for d in valid_domains)
 
-        # 1) 明文 m3u8（必须过白名单）
-        for u in re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', s2):
+        # 1) 明文 m3u8 遍历查找合法源
+        hits = re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', s2)
+        for u in hits:
             if is_whitelisted(u):
                 return u, ''
 
-        # 2) packer 解包
+        # 2) packer 解包遍历查找合法源
         if 'eval(function(p,a,c,k,e' in s2:
             dec = self._unpack(s2)
-            for u in re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', dec):
+            hits = re.findall(r'https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*', dec)
+            for u in hits:
                 if is_whitelisted(u):
                     return u, ''
 
