@@ -1,16 +1,13 @@
 // ==UserScript==
-// @name         Supjav (TVBox Ready)
+// @name         Supjav
 // @namespace    gmspider
-// @version      2026.10.06
-// @description  Supjav GMSpider For TVBox
+// @version      2026.04.06
+// @description  Supjav GMSpider (VOE & New Players Fixed)
 // @author       Luomo
 // @match        https://supjav.com/*
-// @require      https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.slim.min.js
-// @grant        GM_cookie
+// @require      https://cdn.jsdelivr.net/npm/jquery@1.12.4/dist/jquery.min.js
 // @grant        unsafeWindow
 // ==/UserScript==
-
-console.log(JSON.stringify(GM_info));
 (function () {
     const GMSpiderArgs = {};
     if (typeof GmSpiderInject !== 'undefined') {
@@ -23,57 +20,44 @@ console.log(JSON.stringify(GM_info));
     }
     Object.freeze(GMSpiderArgs);
 
+    // 辅助网络请求函数（适配 GM 环境）
+    function request(url, options = {}) {
+        try {
+            let xhr = new XMLHttpRequest();
+            let method = options.method || 'GET';
+            xhr.open(method, url, false); // 同步请求以适应插件流程
+            if (options.headers) {
+                for (let h in options.headers) {
+                    xhr.setRequestHeader(h, options.headers[h]);
+                }
+            }
+            xhr.send(options.data || null);
+            if (xhr.status === 200) {
+                return xhr.responseText;
+            }
+        } catch (e) {
+            console.log("Request error: " + e);
+        }
+        return "";
+    }
+
     const GmSpider = (function () {
         function listVideos() {
             let itemList = [];
-            $(".post").each(function () {
-                const $a =$(this).find(".img a, a.img").first();
-                const $img =$(this).find("img").first();
-                const rawUrl = $a.attr("href") || "";
-                
-                if (!rawUrl) return;
-
-                const rawImg = $img.attr("data-original") || $img.attr("data-src") \vert{}\vert{} $img.attr("src") || "";
-
-                let vodId = "";
-                try {
-                    const urlObj = new URL(rawUrl, window.location.origin);
-                    vodId = urlObj.pathname.replace(/^\/|\/$/g, '').split('/').pop();
-                } catch(e) {
-                    vodId = rawUrl;
-                }
-
+            jQuery(".post").each(function () {
+                const url = new URL(jQuery(this).find(".img").attr("href"));
                 itemList.push({
-                    vod_id: vodId,
-                    vod_name: $a.attr("title") || $img.attr("alt") \vert{}\vert{} $(this).find("h2").text().trim(),
-                    vod_pic: formatImgUrl(rawImg),
-                    vod_remarks: $(this).find(".date").text().trim(),
-                    vod_year: $(this).find(".meta").clone().children().remove().end().text().trim()
-                });
+                    vod_id: url.pathname.split('/').at(2),
+                    vod_name: jQuery(this).find(".img").attr("title"),
+                    vod_pic: formatImgUrl(jQuery(this).find("img").data("original")),
+                    vod_remarks: jQuery(this).find(".date").text(),
+                    vod_year: jQuery(this).find(".meta").children().remove().end().text()
+                })
             });
             return itemList;
         }
 
-        let cf_clearance = null;
-
         function formatImgUrl(url) {
-            if (!url) return "";
-            if (cf_clearance === null && typeof GM_cookie !== 'undefined') {
-                GM_cookie.list({name: "cf_clearance"}, function (cookies, error) {
-                    if (!error && cookies.length > 0) {
-                        cf_clearance = cookies[0].value;
-                        localStorage.setItem("cf_clearance", cf_clearance);
-                    } else {
-                        let cache_cf_clearance = localStorage.getItem("cf_clearance");
-                        if (typeof cache_cf_clearance !== "undefined" && cache_cf_clearance !== null && cache_cf_clearance.length > 0) {
-                            cf_clearance = cache_cf_clearance;
-                        }
-                    }
-                });
-            }
-            if (cf_clearance !== null) {
-                url = url + "@User-Agent=" + window.navigator.userAgent + "@Cookie=cf_clearance=" + cf_clearance;
-            }
             return url;
         }
 
@@ -83,8 +67,14 @@ console.log(JSON.stringify(GM_info));
                     key: "sort",
                     name: "排序",
                     value: [
-                        { n: "观看数", v: "views" },
-                        { n: "更新时间", v: "" }
+                        {
+                            n: "观看数",
+                            v: "views"
+                        },
+                        {
+                            n: "更新时间",
+                            v: ""
+                        }
                     ]
                 }];
                 let result = {
@@ -103,9 +93,18 @@ console.log(JSON.stringify(GM_info));
                             key: "sort",
                             name: "时间",
                             value: [
-                                { n: "本月热门", v: "month" },
-                                { n: "本周热门", v: "week" },
-                                { n: "今日热门", v: "" }
+                                {
+                                    n: "本月热门",
+                                    v: "month"
+                                },
+                                {
+                                    n: "本周热门",
+                                    v: "week"
+                                },
+                                {
+                                    n: "今日热门",
+                                    v: ""
+                                }
                             ]
                         }]
                     },
@@ -115,8 +114,8 @@ console.log(JSON.stringify(GM_info));
                     if (typeof result.filters[item.type_id] === "undefined") {
                         result.filters[item.type_id] = defaultFilter;
                     }
-                });
-                result.list = listVideos();
+                })
+                result.list = listVideos()
                 return result;
             },
             categoryContent: function (tid, pg, filter, extend) {
@@ -125,60 +124,44 @@ console.log(JSON.stringify(GM_info));
                     pagecount: 1
                 };
                 if (tid === "tag") {
-                    $(".categorys .child").each(function () {
-                        const $a =$(this).find("a");
-                        const href = $a.attr("href");
-                        if (!href) return;
-                        
-                        const urlParts = new URL(href, window.location.origin).pathname.replace(/^\/|\/$/g, '').split('/');
-                        const text = $(this).text().trim().split("(");
+                    jQuery(".categorys .child").each(function () {
+                        const url = new URL(jQuery(this).find("a").attr("href")).pathname.split('/');
+                        const text = jQuery(this).text().trim().split("(")
                         result.list.push({
-                            vod_id: urlParts.slice(-2).join('/'),
-                            vod_name: text[0].trim(),
-                            vod_remarks: (text[1] ? parseInt(text[1]) : 0) + " 部影片",
+                            vod_id: url[2] + "/" + url[3],
+                            vod_name: text[0],
+                            vod_remarks: parseInt(text[1]) + " 部影片",
                             vod_tag: "folder",
                             style: {
                                 "type": "rect",
                                 "ratio": 1
                             }
-                        });
+                        })
                     });
-                    const $lastPage =$(".pagination li").not(".next-page, .next").last();
-                    if ($lastPage.length > 0) {
-                        result.pagecount = parseInt($lastPage.text().trim()) || 1;
-                    }
+                    result.pagecount = jQuery(".pagination li").not(".next-page").last().text().trim();
                 } else {
-                    const $lastPage =$(".pagination li").not(".next-page, .next").last();
-                    if ($lastPage.length > 0) {
-                        result.pagecount = parseInt($lastPage.text().trim()) || 1;
+                    if (jQuery(".pagination li").length > 0) {
+                        result.pagecount = jQuery(".pagination li").not(".next-page").last().text().trim();
                     }
                     result.list = listVideos();
                 }
                 return result;
             },
             detailContent: function (ids) {
-                if ($("#vserver").length > 0) $("#vserver").click();
-
+                // 抓取详情页时，同时获取页面中的 data-link 加密标识
                 let vodActor = [], tags = [];
-                $(".post-meta .cats a").each(function () {
-                    const href = $(this).attr("href");
-                    if (!href) return;
-                    const id = new URL(href, window.location.origin).pathname.replace("/zh/", "");
-                    const name = $(this).text().trim();
+                jQuery(".post-meta .cats a").each(function () {
+                    const id = new URL(jQuery(this).attr("href")).pathname.replace("/zh/", "");
+                    const name = jQuery(this).text().trim();
                     vodActor.unshift(`[a=cr:{"id":"${id}","name":"${name}"}/]${name}[/a]`);
                 });
-                $(".post-meta .tags a").each(function () {
-                    const href = $(this).attr("href");
-                    if (!href) return;
-                    const id = new URL(href, window.location.origin).pathname.replace("/zh/", "");
-                    const name = $(this).text().trim();
+                jQuery(".post-meta .tags a").each(function () {
+                    const id = new URL(jQuery(this).attr("href")).pathname.replace("/zh/", "");
+                    const name = jQuery(this).text().trim();
                     tags.push(`[a=cr:{"id":"${id}","name":"${name}"}/]#${name}[/a]`);
                 });
-
-                const $img =$(".post-meta .img, .post-meta img").first();
-                let vodContent = $img.attr("alt") \vert{}\vert{} $(".post-title, h1").first().text().trim();
-                let vodName = vodContent.replace("[无码破解]", '').trim();
-                
+                let vodContent = jQuery(".post-meta .img").attr("alt").trim();
+                let vodName = vodContent.replace("[无码破解]", '');
                 let match = vodName.match(/^[\w|-]+/g);
                 if (match) {
                     if (match[0].includes("-")) {
@@ -192,69 +175,107 @@ console.log(JSON.stringify(GM_info));
                 }
 
                 let vodPlayData = [];
-                const $btnServers =$(".video-wrap .btn-server, .btn-server");
+                let btnServers = jQuery(".video-wrap .btn-server");
+                if (btnServers.length === 0 && jQuery(".video-wrap .cd-server").length > 0) {
+                    btnServers = jQuery(".video-wrap .cd-server:first .btn-server");
+                }
 
-                $btnServers.each(function (i) {
-                    const serverName = $(this).text().trim() || `线路 ${i + 1}`;
+                // 提取每个线路服务器的真实加密 data-link
+                btnServers.each(function (i) {
+                    let serverName = jQuery(this).text().trim();
+                    let lk = jQuery(this).attr("data-link") || "";
+                    if (!lk) {
+                        // 尝试从父级或其他地方匹配
+                        let parentHtml = jQuery(this).prop('outerHTML') || "";
+                        let lkMatch = parentHtml.match(/data-link="([0-9a-f]{40,})"/);
+                        if (lkMatch) lk = lkMatch[1];
+                    }
+                    
                     vodPlayData.push({
-                        from: serverName,
+                        from: serverName || ('线路' + (i + 1)),
                         media: [{
                             name: vodName,
-                            type: "webview",
+                            type: "xurl", // 改用直连/嗅探类型，交由 playerContent 处理解密
                             ext: {
-                                replace: {
-                                    pathname: ids[0],
-                                    link: i
-                                }
+                                url: ids[0] + "$" + lk + "$" + i
                             }
                         }]
                     });
                 });
 
-                const rawImgUrl = $img.attr("src") || $img.attr("data-original") \vert{}\vert{} $img.attr("data-src") || "";
-
-                return {
+                const result = {
                     list: [{
                         vod_id: ids[0],
                         vod_name: vodName,
-                        vod_pic: formatImgUrl(rawImgUrl),
+                        vod_pic: formatImgUrl(jQuery(".post-meta .img").attr("src")),
                         vod_actor: vodActor.join(" "),
                         vod_remarks: tags.join(" "),
                         vod_content: vodContent,
                         vod_play_data: vodPlayData
                     }]
                 };
+                return result;
             },
             playerContent: function (flag, id, vipFlags) {
-                const hash = window.location.hash;
-                let linkIndex = 0;
-                if (hash.includes("#")) {
-                    const idx = parseInt(hash.split("#").pop());
-                    if (!isNaN(idx)) linkIndex = idx;
+                // 解析扩展参数：id 格式为 "vid$lk$index"
+                let parts = id.split("$");
+                let vid = parts[0];
+                let lk = parts[1];
+                
+                if (!lk || lk.length < 20) {
+                    return { parse: 1, url: window.location.href };
                 }
 
-                // 尝试嗅探网页中可能加载出的 video 标签或 iframe 视频源
-                let realUrl = "";
-                const $video =$("video");
-                if ($video.length > 0 &&$video.attr("src")) {
-                    realUrl = $video.attr("src");
+                let detailUrl = "https://supjav.com/zh/" + vid + ".html";
+                let lkBase = "https://lk1.supremejav.com/supjav.php";
+                
+                // 第一步请求：获取 OLID 签名
+                let s1Url = lkBase + "?l=" + lk;
+                let s1 = request(s1Url, { headers: { "Referer": detailUrl } });
+                
+                let olidMatch = s1.match(/var\s+OLID\s*=\s*'([0-9a-f]{40,})'/);
+                let olid = olidMatch ? olidMatch[1].split('').reverse().join('') : lk.split('').reverse().join('');
+                
+                // 第二步请求：获取真实播放载荷
+                let s2 = request(lkBase + "?c=" + olid, { headers: { "Referer": s1Url } });
+                if (!s2) {
+                    return { parse: 1, url: detailUrl };
                 }
 
-                const servers = document.querySelectorAll(`.video-wrap .btn-server, .btn-server`);
-                if (servers.length > linkIndex) {
-                    servers[linkIndex].dispatchEvent(new Event("click", { bubbles: true }));
+                // 匹配 m3u8 地址
+                let m3u8Match = s2.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>:]*/);
+                if (m3u8Match) {
+                    let playUrl = m3u8Match[0].replace(/\\/g, '');
+                    return { parse: 0, url: playUrl };
                 }
 
-                if (realUrl) {
-                    return {
-                        parse: 0,
-                        url: realUrl
-                    };
+                // 匹配 Streamtape 直链
+                let stMatch = s2.match(/https?:\/\/streamtape\.com\/e\/([A-Za-z0-9]+)/);
+                if (stMatch) {
+                    let stPage = request("https://streamtape.com/e/" + stMatch[1] + "/");
+                    let linkMatch = stPage.match(/innerHTML\s*=\s*'([^']+)'\s*\+\s*\('([^']+)'\)\.substring\((\d+)\)/);
+                    if (linkMatch) {
+                        let directUrl = linkMatch[1] + linkMatch[2].substring(parseInt(linkMatch[3]));
+                        if (directUrl.startsWith('//')) directUrl = 'https:' + directUrl;
+                        if (directUrl.indexOf('dl=') === -1) {
+                            directUrl += (directUrl.indexOf('?') !== -1 ? '&dl=1' : '?dl=1');
+                        }
+                        return { parse: 0, url: directUrl };
+                    }
                 }
 
-                return {
-                    type: "match"
-                };
+                // VOE 或其他跳转兜底
+                let locMatch = s2.match(/window\.location\.href\s*=\s*'([^']+)'/) || s2.match(/https?:\/\/[a-z0-9.-]+\/e\/[a-z0-9]{8,}/);
+                if (locMatch) {
+                    let voePage = request(locMatch[1] || locMatch[0], { headers: { "Referer": s1Url } });
+                    let srcMatch = voePage.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>:]*/);
+                    if (srcMatch) {
+                        return { parse: 0, url: srcMatch[0].replace(/\\/g, '') };
+                    }
+                }
+
+                // 最终默认兜底交由内置解析
+                return { parse: 1, url: detailUrl };
             },
             searchContent: function (key, quick, pg) {
                 const result = {
@@ -262,26 +283,17 @@ console.log(JSON.stringify(GM_info));
                     pagecount: 1
                 };
                 result.list = listVideos();
-                const $lastPage =$(".pagination li").not(".next-page, .next").last();
-                if ($lastPage.length > 0) {
-                    result.pagecount = parseInt($lastPage.text().trim()) || 1;
+                if (jQuery(".pagination li").length > 0) {
+                    result.pagecount = jQuery(".pagination li").not(".next-page").last().text().trim();
                 }
                 return result;
             }
         };
     })();
-
-    $(document).ready(function () {
-        if ($(".loading-verifying").length > 0 && typeof GmSpiderInject !== 'undefined') {
-            GmSpiderInject.ShowWebview();
-        }
-    });
-
-    $(unsafeWindow).on("load", function () {
+    jQuery(function () {
         const result = GmSpider[GMSpiderArgs.fName](...GMSpiderArgs.fArgs);
         console.log(result);
         if (typeof GmSpiderInject !== 'undefined') {
-            GmSpiderInject.HideWebview();
             GmSpiderInject.SetSpiderResult(JSON.stringify(result));
         }
     });
