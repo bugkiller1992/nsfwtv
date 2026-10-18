@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Supjav
 // @namespace    gmspider
-// @version      2026.10.18.2
+// @version      2026.10.18.3
 // @description  Supjav GMSpider（兼容新版播放器 + 屏蔽广告/弹窗视频 + 厂牌分类）
 // @author       Luomo
 // @match        https://supjav.com/*
@@ -32,6 +32,12 @@
     // 设成毫秒数（如 15000）：播放器页面加载后过这么久，就关掉网页里的播放器。0 = 不关闭。
     // 注意：设得太短，App 还没嗅探到地址就关了，会直接播放失败。
     const RELEASE_PLAYER_MS = 0;
+    // 每条线路给出几种不同的播放方式（详情页里显示为多个按钮），方便在不同 App 里试哪种能播：
+    //   嵌入：播放器嵌在页面里（主页面地址不变）
+    //   跳转：主页面直接变成视频站的播放页（视频请求的来源就是视频站自己，适合只认主页面来源的 App）
+    //   原站：走 supjav 原本的中间页再进播放器
+    // 确定哪种在你的 App 里能用后，可以把 PLAYER_OPEN / PLAY_MODE 改成对应值，再把这里改成 false
+    const PLAY_VARIANTS = true;
     // 播放时线路地址从哪里取：
     // "fresh"：按线路名（TV/ST/VOE...）取影片页上最新的 data-link（推荐）。
     //          播放页一打开就换成播放器空壳（主页面不跳转，EVS 可用），后台再取一份影片页找新地址。
@@ -555,9 +561,11 @@
 
         // 播放参数放在 query 里（不用 #，因为 # 是 vod_play_url 的剧集分隔符）
         // gmname（线路名）用于播放时在页面上找最新地址；gmlink 只作为找不到时的后备
-        function buildPlayPageUrl(vodId, idx, link, name, cd) {
+        function buildPlayPageUrl(vodId, idx, link, name, cd, variant) {
             let u = "https://supjav.com/zh/" + vodId + "?gmsrv=" + idx;
             if (cd !== undefined) u += "&gmcd=" + cd;
+            if (variant && variant.open) u += "&gmopen=" + variant.open;
+            if (variant && variant.mode) u += "&gmmode=" + variant.mode;
             if (name) u += "&gmname=" + encodeURIComponent(name);
             if (link) u += "&gmlink=" + encodeURIComponent(link);
             return u;
@@ -779,13 +787,18 @@
                             lines[from] = [];
                             lineOrder.push(from);
                         }
-                        lines[from].push({name: ep, url: buildPlayPageUrl(ids[0], i, link, from, cd)});
+                        playVariants().forEach(function (v) {
+                            const n = v.name ? (groups.length > 1 || ep !== epName ? ep + "·" + v.name : v.name) : ep;
+                            lines[from].push({name: n, url: buildPlayPageUrl(ids[0], i, link, from, cd, v)});
+                        });
                     });
                 });
                 // 页面上没有线路（未加载出来/结构变化）：给一条“自动”线路，播放时再到页面上找
                 if (!lineOrder.length) {
                     lineOrder.push("自动");
-                    lines["自动"] = [{name: epName, url: buildPlayPageUrl(ids[0], 0, "", "", 0)}];
+                    lines["自动"] = playVariants().map(v => ({
+                        name: v.name || epName, url: buildPlayPageUrl(ids[0], 0, "", "", 0, v)
+                    }));
                 }
 
                 const vodPlayData = lineOrder.map(from => ({
@@ -897,8 +910,36 @@
         return String((GMSpiderArgs.fArgs || [])[1] || "");
     }
 
+    function playVariants() {
+        if (!PLAY_VARIANTS) return [{name: "", open: "", mode: ""}];
+        return [
+            {name: "嵌入", open: "inplace", mode: "direct"},
+            {name: "跳转", open: "navigate", mode: "direct"},
+            {name: "原站", open: "inplace", mode: "preroll"}
+        ];
+    }
+
+    // 本次播放用的方式：播放链接里的 gmopen / gmmode 优先，否则用配置
+    function playParam(key) {
+        for (const s of [location.href, getPlayArg()]) {
+            const u = safeUrl(s);
+            if (u && u.searchParams.get(key)) return u.searchParams.get(key);
+        }
+        return "";
+    }
+
+    function curOpen() {
+        const v = playParam("gmopen");
+        return /^(inplace|navigate|iframe)$/.test(v) ? v : PLAYER_OPEN;
+    }
+
+    function curMode() {
+        const v = playParam("gmmode");
+        return /^(direct|preroll)$/.test(v) ? v : PLAY_MODE;
+    }
+
     function playerUrl(link) {
-        return PLAY_MODE === "direct"
+        return curMode() === "direct"
             ? PLAYER_BASE + "supjav.php?c=" + encodeURIComponent(reverseStr(link))
             : PLAYER_BASE + "supjav.php?l=" + encodeURIComponent(link) + "&bg=undefined";
     }
@@ -963,7 +1004,7 @@
         return Promise.race([req, timeout]);
     }
 
-    let shellTried = false;
+    let shellTried = false, shellActive = false;
 
     // EVS 友好的播放流程：
     // 1. 一开始（document-start）就把页面换成播放器空壳 → 主页面不再执行网站脚本、不会跳转/刷新
@@ -972,13 +1013,27 @@
     // 3. 后台 fetch 最新影片页拿到新地址，填进播放器；取不到就用详情里缓存的地址
     function tryShellPlayer() {
         if (shellTried) return false;
-        if (PLAYER_OPEN !== "inplace" || PLAY_LINK_SOURCE !== "fresh") return false;
+        const open = curOpen();
+        if ((open !== "inplace" && open !== "navigate") || PLAY_LINK_SOURCE !== "fresh") return false;
         if (!hasJq()) return false;     // jQuery 还没注入：下一轮再试
         shellTried = true;
         if (typeof DOMParser === "undefined" || !W.fetch) return false;
         const p = GmSpider._readPlayParams(getPlayArg());
         // 没有缓存地址（“自动”线路）且页面是验证页时，空壳拿不到任何地址，走页面流程
         if (!p.link && isChallengePage()) return false;
+        if (open === "navigate") {
+            // 跳转方式：先停止 supjav 页面加载（网站脚本不执行），取到最新地址后整页跳到播放器
+            try {
+                window.stop();
+            } catch (e) {
+            }
+            fetchFreshLink(p).then(function (fresh) {
+                const link = fresh || p.link;
+                sendResult({type: "match"});
+                if (link) location.replace(playerUrl(link));
+            });
+            return true;
+        }
         const frame = openPlayerInPlace("");
         if (!frame) return false;
         sendResult({type: "match"});
@@ -1002,7 +1057,7 @@
     // 按 PLAYER_OPEN 打开播放器。返回 true 表示已处理完（结果已发送）
     function openPlayer(link) {
         const src = playerUrl(link);
-        if (PLAYER_OPEN === "navigate") {
+        if (curOpen() === "navigate") {
             sendResult({type: "match"});
             try {
                 window.stop();
@@ -1011,7 +1066,7 @@
             location.replace(src);
             return true;
         }
-        if (PLAYER_OPEN === "inplace" && openPlayerInPlace(src)) {
+        if (curOpen() === "inplace" && openPlayerInPlace(src)) {
             sendResult({type: "match"});
             return true;
         }
@@ -1066,7 +1121,11 @@
 
     function runPlayer(elapsed, challenge) {
         const p = GmSpider._readPlayParams(getPlayArg());
-        if (!/[?&]gmshell=0/.test(location.search) && tryShellPlayer()) return;
+        if (shellActive) return;
+        if (!/[?&]gmshell=0/.test(location.search) && tryShellPlayer()) {
+            shellActive = true;
+            return;
+        }
         let link = "";
         if (PLAY_LINK_SOURCE === "cached" && p.link) {
             link = p.link;
