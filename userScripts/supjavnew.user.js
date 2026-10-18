@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Supjav
 // @namespace    gmspider
-// @version      2026.10.08.3
-// @description  Supjav GMSpider（兼容新版播放器 + 屏蔽广告/弹窗视频）
+// @version      2026.10.18.1
+// @description  Supjav GMSpider（兼容新版播放器 + 屏蔽广告/弹窗视频 + 厂牌分类）
 // @author       Luomo
 // @match        https://supjav.com/*
 // @require      https://cdn.jsdelivr.net/npm/jquery@1.12.4/dist/jquery.min.js
@@ -31,9 +31,22 @@
     // 播放器嗅探到地址、App 开始播放后，网页里的播放器可能还在后台加载同一个视频，和 App 抢带宽。
     // 设成毫秒数（如 15000）：播放器页面加载后过这么久，就关掉网页里的播放器。0 = 不关闭。
     // 注意：设得太短，App 还没嗅探到地址就关了，会直接播放失败。
-    const RELEASE_PLAYER_MS = 15000;
+    const RELEASE_PLAYER_MS = 0;
+    // 播放时线路地址从哪里取：
+    // "fresh"：打开影片页，按线路名（TV/ST/VOE...）取页面上最新的 data-link（推荐）。
+    //          新片/更新过的影片线路会被网站替换，详情里缓存的旧地址会失效 → 播放失败。
+    // "cached"：直接用详情页生成时写进播放链接的地址（最快，但旧地址失效时无法播放）
+    const PLAY_LINK_SOURCE = "fresh";
+    // fresh 模式下最多等影片页多久（毫秒），超时就退回用缓存的地址
+    const FRESH_WAIT_MS = 6000;
+    // 详情页：DOM 解析完后线路按钮仍未出现（网站用 AJAX 加载线路）时，再等多久（毫秒）
+    const DETAIL_BTN_WAIT_MS = 8000;
     // 等待页面的最长时间（毫秒），超时后用已有内容返回结果，避免 App 一直转圈
-    const MAX_WAIT_MS = 20000;
+    const MAX_WAIT_MS = 30000;
+    // Cloudflare 验证页最多等多久（毫秒），超过就返回结果，避免 App 永远转圈
+    const CHALLENGE_MAX_MS = 60000;
+    // 调试：true 时把页面诊断信息写进详情简介（vod_content），方便在 App 里查看失败原因
+    const DEBUG = false;
 
     const GMSpiderArgs = {};
     if (typeof GmSpiderInject !== 'undefined') {
@@ -47,7 +60,10 @@
     Object.freeze(GMSpiderArgs);
 
     const AD_CLASS_RE = /(^|[\s_-])(ad|ads|adv|advert|adsbox|banner|sponsor|sponsored|promo|popup|popunder)([\s_-]|$)/i;
-    const AD_TEXT_RE = /(广告|推广|赞助|下载|download|sponsor|\bads?\b|vip|app)/i;
+    // 线路按钮文字像广告的排除（按整词匹配，避免误伤含 app/vip 字母的线路名）
+    const AD_TEXT_RE = /(广告|推广|赞助|下载|\b(download|sponsor|ads?|vip|app)\b)/i;
+    // 网站正文容器：广告屏蔽永远不删除这些节点（以及包含它们的节点）
+    const KEEP_SEL = ".video-wrap, .post-meta, .post, .posts, .btn-server, .cd-server, .btns, .categorys, .pagination, [data-link], #vserver, .archive-title";
     const SITE_HOST_RE = /(^|\.)supjav\.com$/i;
     const PLAYER_HOST_RE = /(^|\.)supremejav\.com$/i;
     // Cloudflare 人机验证要用到的 iframe / 脚本，必须放行，否则验证永远过不去
@@ -94,6 +110,15 @@
             return !!(u && CF_HOST_RE.test(u.hostname));
         }
 
+        function isProtected(el) {
+            try {
+                return !!(el.matches && (el.matches(KEEP_SEL) || el.querySelector(KEEP_SEL) ||
+                    el.querySelector("[data-gm-player='1']")));
+            } catch (e) {
+                return false;
+            }
+        }
+
         // 轻量判断（只看 class/id，不触发样式计算，解析期间可以对每个节点调用）
         function isAdByName(el) {
             const cls = typeof el.className === "string" ? el.className : "";
@@ -124,8 +149,13 @@
                 return;
             }
             if (tag === "META" || tag === "LINK" || tag === "STYLE") return;
-            if (isAdByName(node) && !node.querySelector("[data-gm-player='1']")) {
-                node.remove();
+            // 解析期间节点刚插入、子元素还没解析出来，无法判断里面有没有正文，
+            // 所以这里只隐藏，不删除（删掉的话，被广告类名包住的线路按钮/列表会一起丢失）
+            if (isAdByName(node) && !isProtected(node)) {
+                try {
+                    node.style.setProperty("display", "none", "important");
+                } catch (e) {
+                }
                 return;
             }
             // 只有带子元素的节点才往下查
@@ -145,12 +175,12 @@
                 if (!isOurPlayer(f)) f.remove();
             });
             document.querySelectorAll("[class*=ad], [id*=ad], [class*=banner], [class*=popup], [class*=sponsor], ins").forEach(el => {
-                if (el.isConnected && el !== document.body && isAdByName(el) && !el.querySelector("[data-gm-player='1']")) el.remove();
+                if (el.isConnected && el !== document.body && isAdByName(el) && !isProtected(el)) el.remove();
             });
             // 悬浮/全屏遮罩只检查 body 的直接子元素，避免对整页做样式计算
             if (document.body) {
                 Array.from(document.body.children).forEach(el => {
-                    if (el.querySelector && el.querySelector("[data-gm-player='1']")) return;
+                    if (isProtected(el)) return;
                     try {
                         const st = getComputedStyle(el);
                         if (st.position === "fixed" && parseInt(st.zIndex, 10) >= 999) el.remove();
@@ -323,7 +353,7 @@
             mo.observe(document, {childList: true, subtree: true, attributes: true, attributeFilter: ["src"]});
         }
 
-        return {install, clean, freeze};
+        return {install, clean, freeze, isProtected};
     })();
 
     // 尽早安装（不等 DOM ready），避免广告视频在 playerContent 之前就被嗅探到
@@ -331,9 +361,11 @@
 
     /* ============================ 爬虫 ============================ */
     const GmSpider = (function () {
-        function isAdNode($el) {
+        // stopSel：向上查到这个容器为止（线路按钮只查到 .video-wrap，外层布局容器的类名不影响判断）
+        function isAdNode($el, stopSel) {
             let node = $el.get(0);
             while (node && node !== document.body) {
+                if (stopSel && node.matches && node.matches(stopSel)) return false;
                 const cls = (node.className && typeof node.className === "string") ? node.className : "";
                 if (AD_CLASS_RE.test(cls) || AD_CLASS_RE.test(node.id || "")) return true;
                 node = node.parentElement;
@@ -388,6 +420,83 @@
             return itemList;
         }
 
+        /* ---------------------------- 厂牌 ---------------------------- */
+        // 厂牌链接：/zh/maker/xxx
+        const MAKER_PATH_RE = /(^|\/)makers?\/[^/]+/i;
+
+        // 站内链接 → 分类 id（去掉语言前缀和 /page/N），例如 "maker/s1-no-1-style"
+        function linkToTid(href) {
+            const u = safeUrl(href);
+            if (!u || !SITE_HOST_RE.test(u.hostname)) return "";
+            const path = u.pathname.split('/').filter(Boolean);
+            if (path[0] === "zh" || path[0] === "en" || path[0] === "ja") path.shift();
+            const pi = path.indexOf("page");
+            if (pi >= 0) path.length = pi;
+            return path.join("/");
+        }
+
+        // "S1 NO.1 STYLE (1,234)" → {name, count}
+        function parseCountText(text) {
+            const t = String(text).replace(/\s+/g, " ").trim();
+            const m = t.match(/^(.*?)\s*[(（]\s*([\d,]+)\s*[)）]\s*$/);
+            if (m) return {name: m[1].trim(), count: parseInt(m[2].replace(/,/g, ""), 10)};
+            return {name: t, count: NaN};
+        }
+
+        // 厂牌列表页（https://supjav.com/zh/maker）：
+        // 先按“类别”页同样的结构（.categorys .child）取；取不到就收集页面里所有厂牌链接
+        function listMakers() {
+            const list = [], seen = {};
+
+            function add(href, text) {
+                const tid = linkToTid(href);
+                if (!tid || !MAKER_PATH_RE.test(tid) || seen[tid]) return;
+                const info = parseCountText(text);
+                if (!info.name) return;
+                seen[tid] = true;
+                list.push({
+                    vod_id: tid,
+                    vod_name: info.name,
+                    vod_remarks: isNaN(info.count) ? "" : info.count + " 部影片",
+                    vod_tag: "folder",
+                    style: {type: "rect", ratio: 1},
+                    _count: info.count
+                });
+            }
+
+            jQuery(".categorys .child").each(function () {
+                const $c = jQuery(this);
+                if (isAdNode($c)) return;
+                add($c.find("a").attr("href"), $c.text());
+            });
+            if (list.length === 0) {
+                jQuery("a[href]").each(function () {
+                    const $a = jQuery(this);
+                    if (isAdNode($a) || $a.closest("header, nav, footer, .menu, .nav").length) return;
+                    let text = $a.text();
+                    // 数量写在链接外面的情况，如 <a>S1</a> (1234)
+                    if (!/[(（]\s*[\d,]+\s*[)）]/.test(text)) {
+                        const next = $a.get(0).nextSibling;
+                        if (next && next.nodeType === 3) text += " " + next.textContent;
+                    }
+                    add($a.attr("href"), text);
+                });
+            }
+            return list;
+        }
+
+        // 排序：count_desc / count_asc / name_asc / name_desc，空 = 网站原顺序
+        function sortMakers(list, order) {
+            const byName = (a, b) => a.vod_name.localeCompare(b.vod_name, "en", {numeric: true, sensitivity: "base"});
+            const cnt = x => isNaN(x._count) ? -1 : x._count;
+            if (order === "count_desc") list.sort((a, b) => cnt(b) - cnt(a) || byName(a, b));
+            else if (order === "count_asc") list.sort((a, b) => cnt(a) - cnt(b) || byName(a, b));
+            else if (order === "name_asc") list.sort(byName);
+            else if (order === "name_desc") list.sort((a, b) => byName(b, a));
+            list.forEach(x => delete x._count);
+            return list;
+        }
+
         function getPageCount() {
             let max = 1;
             jQuery(".pagination li").not(".next-page").each(function () {
@@ -397,12 +506,33 @@
             return max;
         }
 
-        // 线路按钮（detail 与 player 用同一选择器，保证下标一致）
-        function getServerButtons() {
-            if (jQuery(".video-wrap .cd-server").length > 0) {
-                return jQuery(".video-wrap .cd-server:first .btn-server");
+        // 线路按钮分组：多段影片（CD1/CD2...）每段一个 .cd-server，单段影片只有一组
+        // detail 与 player 用同一函数，保证下标一致
+        function getServerGroups() {
+            const groups = [];
+            jQuery(".cd-server").each(function () {
+                const $g = jQuery(this);
+                const $b = $g.find(".btn-server");
+                if (!$b.length) return;
+                // 段名：.cd-server 里按钮以外的文字，如 "CD1"
+                const label = $g.clone().find(".btn-server").remove().end().text().replace(/\s+/g, " ").trim();
+                groups.push({$btns: $b, label: label});
+            });
+            if (!groups.length) {
+                let $b = jQuery(".video-wrap .btn-server");
+                if (!$b.length) $b = jQuery(".btn-server[data-link]");
+                if ($b.length) groups.push({$btns: $b, label: ""});
             }
-            return jQuery(".video-wrap .btn-server");
+            return groups;
+        }
+
+        function getServerButtons() {
+            const g = getServerGroups();
+            return g.length ? g[0].$btns : jQuery();
+        }
+
+        function serverName($btn) {
+            return $btn.text().replace(/\s+/g, " ").trim().replace(/\$|#/g, "");
         }
 
         // 真实线路必须带 data-link；没有 data-link 或文字/链接像广告的都排除
@@ -411,7 +541,8 @@
             if (!link) return false;
             const text = $btn.text().trim();
             if (!text || AD_TEXT_RE.test(text)) return false;
-            if (isAdNode($btn)) return false;
+            // 只看按钮自己和所在的线路组；外层包裹（如 class="ad-free-box"）不算广告
+            if (isAdNode($btn, ".cd-server, .btns, .video-wrap")) return false;
             const href = $btn.attr("href");
             if (href && !href.startsWith("#") && !href.startsWith("javascript")) {
                 const u = safeUrl(href);
@@ -421,12 +552,17 @@
         }
 
         // 播放参数放在 query 里（不用 #，因为 # 是 vod_play_url 的剧集分隔符）
-        function buildPlayPageUrl(vodId, idx, link) {
-            return "https://supjav.com/zh/" + vodId + "?gmsrv=" + idx + "&gmlink=" + encodeURIComponent(link);
+        // gmname（线路名）用于播放时在页面上找最新地址；gmlink 只作为找不到时的后备
+        function buildPlayPageUrl(vodId, idx, link, name, cd) {
+            let u = "https://supjav.com/zh/" + vodId + "?gmsrv=" + idx;
+            if (cd !== undefined) u += "&gmcd=" + cd;
+            if (name) u += "&gmname=" + encodeURIComponent(name);
+            if (link) u += "&gmlink=" + encodeURIComponent(link);
+            return u;
         }
 
         function readPlayParams(id) {
-            const p = {idx: NaN, link: ""};
+            const p = {idx: NaN, cd: 0, name: "", link: ""};
             const sources = [location.href];
             if (typeof id === "string") sources.push(id);
             for (const s of sources) {
@@ -434,6 +570,8 @@
                 if (!u) continue;
                 if (u.searchParams.has("gmsrv")) {
                     p.idx = parseInt(u.searchParams.get("gmsrv"), 10);
+                    p.cd = parseInt(u.searchParams.get("gmcd") || "0", 10) || 0;
+                    p.name = u.searchParams.get("gmname") || "";
                     p.link = u.searchParams.get("gmlink") || "";
                     return p;
                 }
@@ -445,6 +583,41 @@
                 }
             }
             return p;
+        }
+
+        // 在当前页面上找播放参数对应的最新线路地址
+        // 返回 {link, exact}：exact=true 表示按线路名/下标确切找到；false 表示只是兜底（第一条可用线路）
+        function resolveLink(p) {
+            const groups = getServerGroups();
+            if (!groups.length) return {link: "", exact: false};
+            const g = groups[p.cd] || groups[0];
+            const $btns = g.$btns;
+            const real = [];
+            $btns.each(function (i) {
+                const $b = jQuery(this);
+                if (isRealServer($b)) real.push({i: i, name: serverName($b), link: $b.attr("data-link").trim()});
+            });
+            if (!real.length) return {link: "", exact: false};
+            let hit = null;
+            if (p.name) {
+                const same = real.filter(r => r.name === p.name);
+                // 同名线路有多条时（详情里会命名为 TV、TV2...），按下标挑
+                hit = same.find(r => r.i === p.idx) || same[0] || null;
+                if (!hit) {
+                    const m = p.name.match(/^(.*?)(\d+)$/);
+                    if (m) {
+                        const base = real.filter(r => r.name === m[1]);
+                        hit = base[parseInt(m[2], 10) - 1] || null;
+                    }
+                }
+            } else if (!isNaN(p.idx)) {
+                // 旧版播放链接没有线路名，只能按下标
+                hit = real.find(r => r.i === p.idx) || null;
+            }
+            if (!hit && p.link) hit = real.find(r => r.link === p.link) || null;
+            if (hit) return {link: hit.link, exact: true};
+            const sameIdx = real.find(r => r.i === p.idx);
+            return {link: (sameIdx || real[0]).link, exact: false};
         }
 
         function getPlayerBox() {
@@ -479,6 +652,7 @@
                         {type_id: "category/reducing-mosaic", type_name: "无码破解"},
                         {type_id: "category/english-subtitles", type_name: "英文字幕"},
                         {type_id: "tag", type_name: "类别"},
+                        {type_id: "maker", type_name: "厂牌"},
                     ],
                     filters: {
                         popular: [{
@@ -488,6 +662,18 @@
                                 {n: "本月热门", v: "month"},
                                 {n: "本周热门", v: "week"},
                                 {n: "今日热门", v: ""}
+                            ]
+                        }],
+                        // 厂牌列表在脚本里排序（用 order，避免和网站的 sort 参数混在一起）
+                        maker: [{
+                            key: "order",
+                            name: "排序",
+                            value: [
+                                {n: "默认", v: ""},
+                                {n: "数量 多→少", v: "count_desc"},
+                                {n: "数量 少→多", v: "count_asc"},
+                                {n: "名称 A→Z", v: "name_asc"},
+                                {n: "名称 Z→A", v: "name_desc"}
                             ]
                         }]
                     },
@@ -523,6 +709,9 @@
                             style: {type: "rect", ratio: 1}
                         });
                     });
+                } else if (tid === "maker") {
+                    const ext = (extend && typeof extend === "object") ? extend : {};
+                    result.list = sortMakers(listMakers(), ext.order || "");
                 } else {
                     result.list = listVideos();
                 }
@@ -533,28 +722,28 @@
             },
 
             detailContent: function (ids) {
-                // 线路按钮在静态 HTML 里就有，不再点击 #vserver（点击会触发弹窗广告）
-                if (getServerButtons().length === 0) {
-                    const v = document.querySelector("#vserver");
-                    v && v.dispatchEvent(new Event("click"));
-                }
-                let vodActor = [], tags = [];
+                let vodActor = [], vodDirector = [], tags = [];
+                // 名字里有引号/方括号时，手拼的 JSON 会让 App 解析失败，这里用 JSON.stringify 并去掉方括号
+                const crLink = function (id, name, prefix) {
+                    const n = name.replace(/[\[\]]/g, "");
+                    return "[a=cr:" + JSON.stringify({id: id, name: n}) + "/]" + (prefix || "") + n + "[/a]";
+                };
                 jQuery(".post-meta .cats a").each(function () {
-                    const u = safeUrl(jQuery(this).attr("href"));
-                    if (!u) return;
-                    const id = u.pathname.replace("/zh/", "").replace(/^\//, "");
+                    const tid = linkToTid(jQuery(this).attr("href"));
                     const name = jQuery(this).text().trim();
-                    vodActor.unshift(`[a=cr:{"id":"${id}","name":"${name}"}/]${name}[/a]`);
+                    if (!tid || !name) return;
+                    // 厂牌单独放到“导演”一栏，点击进入该厂牌的影片列表
+                    if (MAKER_PATH_RE.test(tid)) vodDirector.push(crLink(tid, name));
+                    else vodActor.unshift(crLink(tid, name));
                 });
                 jQuery(".post-meta .tags a").each(function () {
-                    const u = safeUrl(jQuery(this).attr("href"));
-                    if (!u) return;
-                    const id = u.pathname.replace("/zh/", "").replace(/^\//, "");
+                    const tid = linkToTid(jQuery(this).attr("href"));
                     const name = jQuery(this).text().trim();
-                    tags.push(`[a=cr:{"id":"${id}","name":"${name}"}/]#${name}[/a]`);
+                    if (!tid || !name) return;
+                    tags.push(crLink(tid, name, "#"));
                 });
 
-                let vodContent = (jQuery(".post-meta .img").attr("alt") || document.title || "").trim();
+                let vodContent = (jQuery(".post-meta .img").attr("alt") || jQuery(".archive-title h1, h1").first().text() || document.title || "").trim();
                 let vodName = vodContent.replace("[无码破解]", '').trim();
                 let match = vodName.match(/^[\w|-]+/g);
                 if (match) {
@@ -566,30 +755,53 @@
                     }
                 }
 
-                let vodPlayData = [], playFrom = [], playUrl = [];
-                const seenLink = {};
-                getServerButtons().each(function (i) {
-                    const $btn = jQuery(this);
-                    if (!isRealServer($btn)) return;
-                    const link = $btn.attr("data-link").trim();
-                    if (seenLink[link]) return;
-                    seenLink[link] = true;
-                    const from = $btn.text().trim().replace(/\$|#/g, "");
-                    const pageUrl = buildPlayPageUrl(ids[0], i, link);
-                    vodPlayData.push({
-                        from: from,
-                        media: [{name: vodName, type: "webview", ext: {url: pageUrl}}]
+                if (!vodName) vodName = String(ids[0]).replace(/\.html$/, "");
+                const epName = vodName.replace(/\$|#/g, "");
+
+                // 每个线路名一条线路；多段影片（CD1/CD2）作为该线路下的多集
+                const lineOrder = [], lines = {};
+                const groups = getServerGroups();
+                groups.forEach(function (g, cd) {
+                    const seenLink = {}, nameCount = {};
+                    const ep = groups.length > 1 ? (g.label || ("第" + (cd + 1) + "部分")).replace(/\$|#/g, "") : epName;
+                    g.$btns.each(function (i) {
+                        const $btn = jQuery(this);
+                        if (!isRealServer($btn)) return;
+                        const link = $btn.attr("data-link").trim();
+                        if (seenLink[link]) return;
+                        seenLink[link] = true;
+                        let from = serverName($btn);
+                        nameCount[from] = (nameCount[from] || 0) + 1;
+                        if (nameCount[from] > 1) from = from + nameCount[from];
+                        if (!lines[from]) {
+                            lines[from] = [];
+                            lineOrder.push(from);
+                        }
+                        lines[from].push({name: ep, url: buildPlayPageUrl(ids[0], i, link, from, cd)});
                     });
-                    playFrom.push(from);
-                    playUrl.push(vodName.replace(/\$|#/g, "") + "$" + pageUrl);
                 });
+                // 页面上没有线路（未加载出来/结构变化）：给一条“自动”线路，播放时再到页面上找
+                if (!lineOrder.length) {
+                    lineOrder.push("自动");
+                    lines["自动"] = [{name: epName, url: buildPlayPageUrl(ids[0], 0, "", "", 0)}];
+                }
+
+                const vodPlayData = lineOrder.map(from => ({
+                    from: from,
+                    media: lines[from].map(e => ({name: e.name, type: "webview", ext: {url: e.url}}))
+                }));
+                const playFrom = lineOrder;
+                const playUrl = lineOrder.map(from => lines[from].map(e => e.name + "$" + e.url).join("#"));
+
+                if (DEBUG) vodContent = "[调试] " + pageDiag() + "\n" + vodContent;
 
                 return {
                     list: [{
                         vod_id: ids[0],
                         vod_name: vodName,
-                        vod_pic: formatImgUrl(jQuery(".post-meta .img").attr("src")),
+                        vod_pic: formatImgUrl(jQuery(".post-meta .img").attr("src") || jQuery("meta[property='og:image']").attr("content")),
                         vod_actor: vodActor.join(" "),
+                        vod_director: vodDirector.join(" "),
                         vod_remarks: tags.join(" "),
                         vod_content: vodContent,
                         vod_play_data: vodPlayData,
@@ -599,37 +811,30 @@
                 };
             },
 
-            playerContent: function (flag, id, vipFlags) {
-                const p = readPlayParams(id);
-                let link = p.link;
-                if (!link) {
-                    const btns = getServerButtons();
-                    let $btn = isNaN(p.idx) ? jQuery() : btns.eq(p.idx);
-                    if (!$btn.length || !isRealServer($btn)) {
-                        $btn = btns.filter(function () {
-                            return isRealServer(jQuery(this));
-                        }).first();
-                    }
-                    link = ($btn.attr("data-link") || "").trim();
-                }
+            // 在 supjav 页面里嵌入播放器（PLAYER_OPEN = "iframe"，或 inplace 失败时的后备）
+            playerContent: function (flag, id, vipFlags, linkOverride) {
+                const link = linkOverride || resolveLink(readPlayParams(id)).link || readPlayParams(id).link;
                 if (!link) return {type: "match"};
 
                 // 不再点击网站按钮（会触发 popunder + 前贴片广告页），直接嵌入真实播放页
                 // 先清掉页面上的广告并冻结主页面（停止所有加载和网站定时器），再插入播放器
                 AdGuard.clean();
                 AdGuard.freeze(false);
-                const src = playerUrl(link);
                 const iframe = document.createElement("iframe");
                 iframe.setAttribute("data-gm-player", "1");
                 iframe.setAttribute("allow", "autoplay; fullscreen; encrypted-media");
                 iframe.setAttribute("allowfullscreen", "true");
                 iframe.setAttribute("referrerpolicy", "unsafe-url");
                 iframe.style.cssText = "position:absolute;inset:0;width:100%;height:100%;border:0;";
-                iframe.src = src;
+                iframe.src = playerUrl(link);
                 getPlayerBox().appendChild(iframe);
 
                 return {type: "match"};
             },
+
+            _resolveLink: resolveLink,
+            _readPlayParams: readPlayParams,
+            _getServerGroups: getServerGroups,
 
             searchContent: function (key, quick, pg) {
                 return {
@@ -642,14 +847,40 @@
     })();
 
     /* ============================ 调度 ============================ */
+    // 页面上有网站正文 → 一定不是验证页
+    function hasSiteContent() {
+        return !!document.querySelector(".post, .video-wrap, .post-meta, .categorys, .pagination, .archive-title, .btn-server");
+    }
+
+    // 只认真正的 Cloudflare 验证页。
+    // 旧版把 script[src*='challenge-platform'] 也当成验证页，但 Cloudflare 会往【正常页面】里注入
+    // /cdn-cgi/challenge-platform/.../jsd/main.js（尤其是还没进缓存的新影片页），
+    // 导致脚本一直以为在验证、永远不返回结果 —— 新片“打不开、重试几次才偶尔能开”就是这个原因之一。
     function isChallengePage() {
         if (/^\/cdn-cgi\//.test(location.pathname)) return true;
+        if (hasSiteContent()) return false;
         const t = document.title || "";
-        if (/just a moment|attention required|请稍候|請稍候|checking your browser/i.test(t)) return true;
-        return !!document.querySelector("#challenge-form, #challenge-running, #cf-challenge-running, .cf-turnstile, #cf-wrapper, script[src*='challenge-platform']");
+        if (/just a moment|attention required|请稍候|請稍候|checking your browser|one more step/i.test(t)) return true;
+        return !!document.querySelector("#challenge-form, #challenge-running, #cf-challenge-running, #challenge-stage, #challenge-success-text, .cf-turnstile, #cf-wrapper");
+    }
+
+    function pageDiag() {
+        const q = s => document.querySelectorAll(s).length;
+        return "ready=" + document.readyState +
+            " t=" + (Date.now() - started) + "ms" +
+            " challenge=" + isChallengePage() +
+            " title=" + JSON.stringify((document.title || "").slice(0, 40)) +
+            " video-wrap=" + q(".video-wrap") +
+            " cd-server=" + q(".cd-server") +
+            " btn-server=" + q(".btn-server") +
+            " data-link=" + q("[data-link]") +
+            " vserver=" + q("#vserver") +
+            " post-meta=" + q(".post-meta") +
+            " tags=" + q(".post-meta .tags a");
     }
 
     let done = false;
+    const started = Date.now();
 
     function sendResult(result) {
         if (done) return;
@@ -660,12 +891,8 @@
         }
     }
 
-    function getPlayLinkFromUrl() {
-        for (const s of [location.href, String((GMSpiderArgs.fArgs || [])[1] || "")]) {
-            const u = safeUrl(s);
-            if (u && u.searchParams.get("gmlink")) return u.searchParams.get("gmlink");
-        }
-        return "";
+    function getPlayArg() {
+        return String((GMSpiderArgs.fArgs || [])[1] || "");
     }
 
     function playerUrl(link) {
@@ -674,7 +901,7 @@
             : PLAYER_BASE + "supjav.php?l=" + encodeURIComponent(link) + "&bg=undefined";
     }
 
-    // 播放快速通道：线路地址已经写在播放链接里，不需要等 supjav 页面加载
+    // 把当前页面换成只有播放器的空白页（网址不变）
     function openPlayerInPlace(src) {
         const esc = src.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
         const html = '<!DOCTYPE html><html><head><meta charset="utf-8">' +
@@ -685,7 +912,7 @@
             '<body><iframe data-gm-player="1" allow="autoplay; fullscreen; encrypted-media" allowfullscreen ' +
             'referrerpolicy="unsafe-url" src="' + esc + '"></iframe></body></html>';
         try {
-            // 中止 supjav 页面剩余部分的解析和加载，换成只有播放器的页面（网址不变）
+            // 中止 supjav 页面剩余部分的解析和加载，换成只有播放器的页面
             document.open();
             document.write(html);
             document.close();
@@ -707,16 +934,11 @@
                 }, RELEASE_PLAYER_MS);
             });
         }
-        return !!frame;
+        return !!(frame && frame.getAttribute("src") === src);
     }
 
-    let fastTried = false;
-
-    function tryFastPlayer() {
-        if (fastTried || GMSpiderArgs.fName !== "playerContent" || PLAYER_OPEN === "iframe") return false;
-        fastTried = true;
-        const link = getPlayLinkFromUrl();
-        if (!link) return false;
+    // 按 PLAYER_OPEN 打开播放器。返回 true 表示已处理完（结果已发送）
+    function openPlayer(link) {
         const src = playerUrl(link);
         if (PLAYER_OPEN === "navigate") {
             sendResult({type: "match"});
@@ -727,33 +949,138 @@
             location.replace(src);
             return true;
         }
-        // inplace：替换失败（个别 WebView 不允许）时返回 false，退回到 iframe 方式
-        if (!openPlayerInPlace(src)) return false;
-        sendResult({type: "match"});
+        if (PLAYER_OPEN === "inplace" && openPlayerInPlace(src)) {
+            sendResult({type: "match"});
+            return true;
+        }
+        // iframe 方式（或 inplace 失败）：要等 jQuery 和页面结构
+        if (!hasJq() || !document.body) return false;
+        let result;
+        try {
+            result = GmSpider.playerContent(GMSpiderArgs.fArgs[0], getPlayArg(), GMSpiderArgs.fArgs[2], link);
+        } catch (e) {
+            console.error(e);
+            result = {type: "match"};
+        }
+        sendResult(result);
         return true;
     }
 
-    // 详情页数据（标题 + 线路按钮 + 标签）在 HTML 里出现后就可以提前取，不必等整页加载完
-    function detailReady() {
-        return !!(document.querySelector(".post-meta .img") &&
-            document.querySelector(".video-wrap .btn-server") &&
-            document.querySelector(".post-meta .tags"));
+    let vserverClicked = false;
+
+    // 网站把线路改成点击 #vserver 后 AJAX 加载时，静态 HTML 里没有按钮，触发一次网站自己的加载
+    // （window.open 已被屏蔽，触发的弹窗广告不会出现）
+    function triggerServerLoad() {
+        if (vserverClicked) return;
+        vserverClicked = true;
+        try {
+            const v = document.querySelector("#vserver");
+            if (v) {
+                if (hasJq()) jQuery(v).trigger("click");
+                else v.dispatchEvent(new MouseEvent("click", {bubbles: true}));
+            }
+        } catch (e) {
+        }
     }
+
+    // 线路区块是否已解析完：区块（或它的任一祖先）后面已经出现了别的元素
+    function serverBlockClosed() {
+        const all = document.querySelectorAll(".btn-server[data-link]");
+        if (!all.length) return false;
+        const last = all[all.length - 1];
+        let node = last.closest(".video-wrap") || (last.parentElement && last.parentElement.parentElement) || last;
+        while (node && node !== document.body && node !== document.documentElement) {
+            if (node.nextElementSibling) return true;
+            node = node.parentElement;
+        }
+        return false;
+    }
+
+    function countButtons() {
+        return document.querySelectorAll(".btn-server[data-link]").length;
+    }
+
+    let pendingLink = "";
+
+    function runPlayer(elapsed, challenge) {
+        const p = GmSpider._readPlayParams(getPlayArg());
+        let link = "";
+        if (PLAY_LINK_SOURCE === "cached" && p.link) {
+            link = p.link;
+        } else if (!pendingLink) {
+            if (!challenge && hasJq()) {
+                const domDone = document.readyState !== "loading";
+                const r = GmSpider._resolveLink(p);
+                if (r.link && (r.exact || domDone)) link = r.link;
+                else if (domDone && !r.link) triggerServerLoad();
+            }
+            // 页面迟迟拿不到（验证页 / 网站很慢）：退回到详情里缓存的地址
+            if (!link && elapsed > FRESH_WAIT_MS && p.link) link = p.link;
+            if (!link && elapsed > (challenge ? CHALLENGE_MAX_MS : MAX_WAIT_MS)) {
+                sendResult({type: "match"});
+                return;
+            }
+        }
+        if (pendingLink) link = pendingLink;
+        if (!link) return;
+        pendingLink = link;     // iframe 方式要等页面结构时，下一轮继续用同一个地址
+        openPlayer(link);
+    }
+
+    let lastBtnCount = -1, stableTicks = 0, domDoneAt = 0;
 
     function hasJq() {
         return typeof jQuery === "function" && jQuery.fn && jQuery.fn.jquery;
     }
 
-    function run(force) {
+    function run(source) {
         if (done) return;
-        if (isChallengePage()) return;            // 验证页：不返回空结果，等验证通过后页面会自动刷新
-        if (tryFastPlayer()) return;
-        if (!hasJq()) return;
+        const elapsed = Date.now() - started;
         const fName = GMSpiderArgs.fName;
-        const domDone = document.readyState !== "loading";
-        if (!force && !domDone && !(fName === "detailContent" && detailReady())) return;
+        const challenge = isChallengePage();
 
-        const isPlayer = fName === "playerContent";
+        if (fName === "playerContent") return runPlayer(elapsed, challenge);
+
+        // 验证页：等验证通过后页面自动刷新；但最多等 CHALLENGE_MAX_MS，避免 App 永远转圈
+        if (challenge) {
+            if (elapsed > CHALLENGE_MAX_MS) sendResult({list: [], error: "cloudflare challenge timeout"});
+            return;
+        }
+        if (!hasJq()) {
+            if (elapsed > MAX_WAIT_MS) sendResult({list: [], error: "jquery not loaded"});
+            return;
+        }
+        const domDone = document.readyState !== "loading";
+        const overtime = elapsed > MAX_WAIT_MS;
+
+        if (fName === "detailContent") {
+            const n = countButtons();
+            if (n !== lastBtnCount) {
+                lastBtnCount = n;
+                stableTicks = 0;
+            } else if (source === "tick") {
+                stableTicks++;
+            }
+            let ready = false;
+            if (overtime) {
+                ready = true;
+            } else if (n > 0) {
+                // 解析中途提前返回：只有当线路区块已经解析完（解析器已经走到它后面的元素），
+                // 且标题/标签已出现时才返回，避免只解析出第一个按钮就返回、丢掉后面的线路
+                ready = domDone || (stableTicks >= 1 && serverBlockClosed() &&
+                    !!document.querySelector(".post-meta .img") &&
+                    !!document.querySelector(".post-meta .tags, .post-meta .cats"));
+            } else if (domDone) {
+                // DOM 已完成但没有线路按钮：可能是 AJAX 加载，触发并等一会儿
+                if (!domDoneAt) domDoneAt = Date.now();
+                triggerServerLoad();
+                ready = Date.now() - domDoneAt > DETAIL_BTN_WAIT_MS;
+            }
+            if (!ready) return;
+        } else if (!domDone && !overtime) {
+            return;
+        }
+
         let result;
         try {
             result = GmSpider[fName](...GMSpiderArgs.fArgs);
@@ -761,36 +1088,32 @@
             console.error(e);
             result = {list: [], error: String(e)};
         }
-        // 页面还没加载完、却什么都没取到：多半是页面不完整，继续等，不返回空结果
-        if (!force && !domDone && !isPlayer && result && Array.isArray(result.list) && result.list.length === 0) return;
+        // 列表页 DOM 已完成却一条都没取到：可能页面还在被替换（验证通过后刷新等），最多再等 3 秒
+        if (fName !== "detailContent" && result && Array.isArray(result.list) && result.list.length === 0) {
+            if (!domDoneAt) domDoneAt = Date.now();
+            if (!overtime && source !== "load" && Date.now() - domDoneAt < 3000) return;
+        }
+        if (DEBUG && result && fName !== "detailContent") result._debug = pageDiag();
         sendResult(result);
         // 列表/搜索/详情拿到数据后立即冻结页面，避免后台广告继续加载、拖慢 App
-        if (!isPlayer) AdGuard.freeze(true);
+        AdGuard.freeze(true);
     }
 
-    // 1. 立即尝试（播放快速通道）
-    run(false);
+    // 1. 立即尝试（cached 模式的播放快速通道）
+    run("start");
     if (!done) {
         // 2. DOM 解析完成
         document.addEventListener("DOMContentLoaded", function () {
-            run(false);
+            run("dom");
         });
-        // 3. 解析过程中轮询（详情页提前返回；验证通过后继续）
-        const started = Date.now();
+        // 3. 解析过程中轮询（详情页提前返回、AJAX 线路、验证通过后继续、超时兜底）
         const timer = setInterval(function () {
             if (done) return clearInterval(timer);
-            const overtime = Date.now() - started > MAX_WAIT_MS;
-            if (overtime && !isChallengePage()) {
-                clearInterval(timer);
-                run(true);
-            } else {
-                run(false);
-            }
+            run("tick");
         }, 250);
         // 4. 页面完全加载
         window.addEventListener("load", function () {
-            run(true);
+            run("load");
         });
     }
 })();
-
