@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Supjav
 // @namespace    gmspider
-// @version      2026.10.18.4
+// @version      2026.10.18.1
 // @description  Supjav GMSpider（兼容新版播放器 + 屏蔽广告/弹窗视频 + 厂牌分类）
 // @author       Luomo
 // @match        https://supjav.com/*
@@ -32,15 +32,8 @@
     // 设成毫秒数（如 15000）：播放器页面加载后过这么久，就关掉网页里的播放器。0 = 不关闭。
     // 注意：设得太短，App 还没嗅探到地址就关了，会直接播放失败。
     const RELEASE_PLAYER_MS = 0;
-    // 每条线路给出几种不同的播放方式（详情页里显示为多个按钮），方便在不同 App 里试哪种能播：
-    //   嵌入：播放器嵌在页面里（主页面地址不变）
-    //   跳转：主页面直接变成视频站的播放页（视频请求的来源就是视频站自己，适合只认主页面来源的 App）
-    //   原站：走 supjav 原本的中间页再进播放器
-    // 确定哪种在你的 App 里能用后，可以把 PLAYER_OPEN / PLAY_MODE 改成对应值，再把这里改成 false
-    const PLAY_VARIANTS = false;
     // 播放时线路地址从哪里取：
-    // "fresh"：按线路名（TV/ST/VOE...）取影片页上最新的 data-link（推荐）。
-    //          播放页一打开就换成播放器空壳（主页面不跳转，EVS 可用），后台再取一份影片页找新地址。
+    // "fresh"：打开影片页，按线路名（TV/ST/VOE...）取页面上最新的 data-link（推荐）。
     //          新片/更新过的影片线路会被网站替换，详情里缓存的旧地址会失效 → 播放失败。
     // "cached"：直接用详情页生成时写进播放链接的地址（最快，但旧地址失效时无法播放）
     const PLAY_LINK_SOURCE = "fresh";
@@ -515,10 +508,9 @@
 
         // 线路按钮分组：多段影片（CD1/CD2...）每段一个 .cd-server，单段影片只有一组
         // detail 与 player 用同一函数，保证下标一致
-        // ctx：可选，另一个 document（播放时用 fetch 取回的影片页）；不传就是当前页面
-        function getServerGroups(ctx) {
+        function getServerGroups() {
             const groups = [];
-            jQuery(".cd-server", ctx || document).each(function () {
+            jQuery(".cd-server").each(function () {
                 const $g = jQuery(this);
                 const $b = $g.find(".btn-server");
                 if (!$b.length) return;
@@ -527,8 +519,8 @@
                 groups.push({$btns: $b, label: label});
             });
             if (!groups.length) {
-                let $b = jQuery(".video-wrap .btn-server", ctx || document);
-                if (!$b.length) $b = jQuery(".btn-server[data-link]", ctx || document);
+                let $b = jQuery(".video-wrap .btn-server");
+                if (!$b.length) $b = jQuery(".btn-server[data-link]");
                 if ($b.length) groups.push({$btns: $b, label: ""});
             }
             return groups;
@@ -561,11 +553,9 @@
 
         // 播放参数放在 query 里（不用 #，因为 # 是 vod_play_url 的剧集分隔符）
         // gmname（线路名）用于播放时在页面上找最新地址；gmlink 只作为找不到时的后备
-        function buildPlayPageUrl(vodId, idx, link, name, cd, variant) {
+        function buildPlayPageUrl(vodId, idx, link, name, cd) {
             let u = "https://supjav.com/zh/" + vodId + "?gmsrv=" + idx;
             if (cd !== undefined) u += "&gmcd=" + cd;
-            if (variant && variant.open) u += "&gmopen=" + variant.open;
-            if (variant && variant.mode) u += "&gmmode=" + variant.mode;
             if (name) u += "&gmname=" + encodeURIComponent(name);
             if (link) u += "&gmlink=" + encodeURIComponent(link);
             return u;
@@ -597,8 +587,8 @@
 
         // 在当前页面上找播放参数对应的最新线路地址
         // 返回 {link, exact}：exact=true 表示按线路名/下标确切找到；false 表示只是兜底（第一条可用线路）
-        function resolveLink(p, ctx) {
-            const groups = getServerGroups(ctx);
+        function resolveLink(p) {
+            const groups = getServerGroups();
             if (!groups.length) return {link: "", exact: false};
             const g = groups[p.cd] || groups[0];
             const $btns = g.$btns;
@@ -787,18 +777,13 @@
                             lines[from] = [];
                             lineOrder.push(from);
                         }
-                        playVariants().forEach(function (v) {
-                            const n = v.name ? (groups.length > 1 || ep !== epName ? ep + "·" + v.name : v.name) : ep;
-                            lines[from].push({name: n, url: buildPlayPageUrl(ids[0], i, link, from, cd, v)});
-                        });
+                        lines[from].push({name: ep, url: buildPlayPageUrl(ids[0], i, link, from, cd)});
                     });
                 });
                 // 页面上没有线路（未加载出来/结构变化）：给一条“自动”线路，播放时再到页面上找
                 if (!lineOrder.length) {
                     lineOrder.push("自动");
-                    lines["自动"] = playVariants().map(v => ({
-                        name: v.name || epName, url: buildPlayPageUrl(ids[0], 0, "", "", 0, v)
-                    }));
+                    lines["自动"] = [{name: epName, url: buildPlayPageUrl(ids[0], 0, "", "", 0)}];
                 }
 
                 const vodPlayData = lineOrder.map(from => ({
@@ -910,53 +895,24 @@
         return String((GMSpiderArgs.fArgs || [])[1] || "");
     }
 
-    function playVariants() {
-        if (!PLAY_VARIANTS) return [{name: "", open: "", mode: ""}];
-        return [
-            {name: "嵌入", open: "inplace", mode: "direct"},
-            {name: "跳转", open: "navigate", mode: "direct"},
-            {name: "原站", open: "inplace", mode: "preroll"}
-        ];
-    }
-
-    // 本次播放用的方式：播放链接里的 gmopen / gmmode 优先，否则用配置
-    function playParam(key) {
-        for (const s of [location.href, getPlayArg()]) {
-            const u = safeUrl(s);
-            if (u && u.searchParams.get(key)) return u.searchParams.get(key);
-        }
-        return "";
-    }
-
-    function curOpen() {
-        const v = playParam("gmopen");
-        return /^(inplace|navigate|iframe)$/.test(v) ? v : PLAYER_OPEN;
-    }
-
-    function curMode() {
-        const v = playParam("gmmode");
-        return /^(direct|preroll)$/.test(v) ? v : PLAY_MODE;
-    }
-
     function playerUrl(link) {
-        return curMode() === "direct"
+        return PLAY_MODE === "direct"
             ? PLAYER_BASE + "supjav.php?c=" + encodeURIComponent(reverseStr(link))
             : PLAYER_BASE + "supjav.php?l=" + encodeURIComponent(link) + "&bg=undefined";
     }
 
-    // 把当前页面换成只有播放器的空白页（网址不变）。src 为空时先放一个空的播放器框，稍后再填地址
-    // 返回播放器 iframe（失败返回 null）
+    // 把当前页面换成只有播放器的空白页（网址不变）
     function openPlayerInPlace(src) {
-        const srcAttr = src ? ' src="' + src.replace(/&/g, "&amp;").replace(/"/g, "&quot;") + '"' : "";
+        const esc = src.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
         const html = '<!DOCTYPE html><html><head><meta charset="utf-8">' +
             '<meta name="viewport" content="width=device-width,initial-scale=1">' +
             '<meta name="referrer" content="unsafe-url">' +
             '<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}' +
             'iframe{position:fixed;left:0;top:0;width:100%;height:100%;border:0}</style></head>' +
             '<body><iframe data-gm-player="1" allow="autoplay; fullscreen; encrypted-media" allowfullscreen ' +
-            'referrerpolicy="unsafe-url"' + srcAttr + '></iframe></body></html>';
+            'referrerpolicy="unsafe-url" src="' + esc + '"></iframe></body></html>';
         try {
-            // 中止 supjav 页面剩余部分的解析和加载（网站脚本不再执行，不会跳转/刷新），换成只有播放器的页面
+            // 中止 supjav 页面剩余部分的解析和加载，换成只有播放器的页面
             document.open();
             document.write(html);
             document.close();
@@ -964,11 +920,10 @@
             console.error(e);
         }
         const frame = document.querySelector("iframe[data-gm-player='1']");
-        if (!frame || (src && frame.getAttribute("src") !== src)) return null;
-        if (RELEASE_PLAYER_MS > 0) {
+        if (frame && RELEASE_PLAYER_MS > 0) {
             let released = false;
             frame.addEventListener("load", function () {
-                if (released || !frame.getAttribute("src")) return;
+                if (released) return;
                 released = true;
                 setTimeout(function () {
                     try {
@@ -979,85 +934,13 @@
                 }, RELEASE_PLAYER_MS);
             });
         }
-        return frame;
-    }
-
-    // 后台取一份最新的影片页（同源请求，带 Cloudflare cookie），在里面找线路的最新地址
-    function fetchFreshLink(p) {
-        const pageUrl = location.origin + location.pathname;
-        const req = W.fetch(pageUrl, {credentials: "include"})
-            .then(function (r) {
-                return r.text();
-            })
-            .then(function (html) {
-                const doc = new DOMParser().parseFromString(html, "text/html");
-                return GmSpider._resolveLink(p, doc).link || "";
-            })
-            .catch(function () {
-                return "";
-            });
-        const timeout = new Promise(function (resolve) {
-            setTimeout(function () {
-                resolve("");
-            }, FRESH_WAIT_MS);
-        });
-        return Promise.race([req, timeout]);
-    }
-
-    let shellTried = false, shellActive = false;
-
-    // EVS 友好的播放流程：
-    // 1. 一开始（document-start）就把页面换成播放器空壳 → 主页面不再执行网站脚本、不会跳转/刷新
-    //    （EVS 一旦检测到主页面跳转就提示“播放地址加载失败”；VAS 不在乎）
-    // 2. 立即把 match 结果交给 App（和旧版快速通道时序一致）
-    // 3. 后台 fetch 最新影片页拿到新地址，填进播放器；取不到就用详情里缓存的地址
-    function tryShellPlayer() {
-        if (shellTried) return false;
-        const open = curOpen();
-        if ((open !== "inplace" && open !== "navigate") || PLAY_LINK_SOURCE !== "fresh") return false;
-        if (!hasJq()) return false;     // jQuery 还没注入：下一轮再试
-        shellTried = true;
-        if (typeof DOMParser === "undefined" || !W.fetch) return false;
-        const p = GmSpider._readPlayParams(getPlayArg());
-        // 没有缓存地址（“自动”线路）且页面是验证页时，空壳拿不到任何地址，走页面流程
-        if (!p.link && isChallengePage()) return false;
-        if (open === "navigate") {
-            // 跳转方式：先停止 supjav 页面加载（网站脚本不执行），取到最新地址后整页跳到播放器
-            try {
-                window.stop();
-            } catch (e) {
-            }
-            fetchFreshLink(p).then(function (fresh) {
-                const link = fresh || p.link;
-                sendResult({type: "match"});
-                if (link) location.replace(playerUrl(link));
-            });
-            return true;
-        }
-        const frame = openPlayerInPlace("");
-        if (!frame) return false;
-        sendResult({type: "match"});
-        fetchFreshLink(p).then(function (fresh) {
-            const link = fresh || p.link;
-            if (link) {
-                frame.src = playerUrl(link);
-            } else {
-                // 实在拿不到地址：重新打开影片页，走页面内取地址的流程
-                try {
-                    const u = new URL(location.href);
-                    u.searchParams.set("gmshell", "0");
-                    location.replace(u.href);
-                } catch (e) {
-                }
-            }
-        });
-        return true;
+        return !!(frame && frame.getAttribute("src") === src);
     }
 
     // 按 PLAYER_OPEN 打开播放器。返回 true 表示已处理完（结果已发送）
     function openPlayer(link) {
         const src = playerUrl(link);
-        if (curOpen() === "navigate") {
+        if (PLAYER_OPEN === "navigate") {
             sendResult({type: "match"});
             try {
                 window.stop();
@@ -1066,7 +949,7 @@
             location.replace(src);
             return true;
         }
-        if (curOpen() === "inplace" && openPlayerInPlace(src)) {
+        if (PLAYER_OPEN === "inplace" && openPlayerInPlace(src)) {
             sendResult({type: "match"});
             return true;
         }
@@ -1121,11 +1004,6 @@
 
     function runPlayer(elapsed, challenge) {
         const p = GmSpider._readPlayParams(getPlayArg());
-        if (shellActive) return;
-        if (!/[?&]gmshell=0/.test(location.search) && tryShellPlayer()) {
-            shellActive = true;
-            return;
-        }
         let link = "";
         if (PLAY_LINK_SOURCE === "cached" && p.link) {
             link = p.link;
