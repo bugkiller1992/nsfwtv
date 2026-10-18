@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Supjav
 // @namespace    gmspider
-// @version      2026.10.18.3
+// @version      2026.10.18.4
 // @description  Supjav GMSpider（兼容新版播放器 + 屏蔽广告/弹窗视频 + 厂牌分类）
 // @author       Luomo
 // @match        https://supjav.com/*
@@ -37,7 +37,7 @@
     //   跳转：主页面直接变成视频站的播放页（视频请求的来源就是视频站自己，适合只认主页面来源的 App）
     //   原站：走 supjav 原本的中间页再进播放器
     // 确定哪种在你的 App 里能用后，可以把 PLAYER_OPEN / PLAY_MODE 改成对应值，再把这里改成 false
-    const PLAY_VARIANTS = true;
+    const PLAY_VARIANTS = false;
     // 播放时线路地址从哪里取：
     // "fresh"：按线路名（TV/ST/VOE...）取影片页上最新的 data-link（推荐）。
     //          播放页一打开就换成播放器空壳（主页面不跳转，EVS 可用），后台再取一份影片页找新地址。
