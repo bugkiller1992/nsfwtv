@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Supjav
 // @namespace    gmspider
-// @version      2026.10.18.1
+// @version      2026.10.21.1
 // @description  Supjav GMSpider（兼容新版播放器 + 屏蔽广告/弹窗视频 + 厂牌分类）
 // @author       Luomo
 // @match        https://supjav.com/*
@@ -356,8 +356,57 @@
         return {install, clean, freeze, isProtected};
     })();
 
-    // 尽早安装（不等 DOM ready），避免广告视频在 playerContent 之前就被嗅探到
-    AdGuard.install();
+    // Cloudflare 验证页上绝不能改动浏览器（替换 fetch/XHR/媒体接口、加 CSP 等）：
+    // 验证脚本会检查这些原生接口，发现被改过就判定为机器人，勾选验证会一直循环、永远过不去。
+    // 所以先等 <title> 解析出来判断是不是验证页，确认是正常页面后再安装广告屏蔽。
+    function isChallengeDoc() {
+        if (/^\/cdn-cgi\//.test(location.pathname)) return true;
+        const t = document.title || "";
+        if (/just a moment|attention required|请稍候|請稍候|checking your browser|one more step|security verification|verifying you are human/i.test(t)) return true;
+        const scripts = document.getElementsByTagName("script");
+        for (let i = 0; i < scripts.length; i++) {
+            const sc = scripts[i];
+            const src = sc.getAttribute("src") || "";
+            if (/challenge-platform\/h\/[^/]+\/orchestrate\//.test(src)) return true;
+            if (!src && sc.textContent.indexOf("_cf_chl_opt") >= 0) return true;
+        }
+        return false;
+    }
+
+    let guardDecided = false;
+
+    function decideGuard(final) {
+        if (guardDecided) return;
+        if (isChallengeDoc()) {
+            guardDecided = true;    // 验证页：什么都不装
+            return;
+        }
+        // 正常页面的 <title> 已经出现，或者已经开始解析 <body>：安装广告屏蔽并补清一次已插入的节点
+        if (final || (document.querySelector("title") && document.title) || document.body) {
+            guardDecided = true;
+            AdGuard.install();
+            // 安装前已经插入的广告 iframe / 视频补删一次（不按类名删，页面还没解析完，容器里可能还没有正文）
+            try {
+                document.querySelectorAll("iframe, embed, object, video, audio").forEach(function (el) {
+                    if (el.getAttribute("data-gm-player") !== "1" && !/cloudflare\.com/i.test(el.getAttribute("src") || "")) el.remove();
+                });
+            } catch (e) {
+            }
+        }
+    }
+
+    decideGuard(false);
+    if (!guardDecided) {
+        const gmo = new MutationObserver(function () {
+            decideGuard(false);
+            if (guardDecided) gmo.disconnect();
+        });
+        gmo.observe(document, {childList: true, subtree: true});
+        document.addEventListener("DOMContentLoaded", function () {
+            decideGuard(true);
+            gmo.disconnect();
+        });
+    }
 
     /* ============================ 爬虫 ============================ */
     const GmSpider = (function () {
@@ -856,11 +905,13 @@
     // 旧版把 script[src*='challenge-platform'] 也当成验证页，但 Cloudflare 会往【正常页面】里注入
     // /cdn-cgi/challenge-platform/.../jsd/main.js（尤其是还没进缓存的新影片页），
     // 导致脚本一直以为在验证、永远不返回结果 —— 新片“打不开、重试几次才偶尔能开”就是这个原因之一。
+    // 新版验证页（2026-10）的元素 id/class 都是随机的，旧选择器认不出来；改为看标题、_cf_chl_opt 脚本和页面文字
     function isChallengePage() {
         if (/^\/cdn-cgi\//.test(location.pathname)) return true;
         if (hasSiteContent()) return false;
-        const t = document.title || "";
-        if (/just a moment|attention required|请稍候|請稍候|checking your browser|one more step/i.test(t)) return true;
+        if (isChallengeDoc()) return true;
+        const txt = document.body ? (document.body.innerText || "").slice(0, 600) : "";
+        if (/verifying you are human|performing security verification|verify you are human|正在验证您是否是真人|确认您是真人/i.test(txt)) return true;
         return !!document.querySelector("#challenge-form, #challenge-running, #cf-challenge-running, #challenge-stage, #challenge-success-text, .cf-turnstile, #cf-wrapper");
     }
 
@@ -1043,7 +1094,7 @@
 
         // 验证页：等验证通过后页面自动刷新；但最多等 CHALLENGE_MAX_MS，避免 App 永远转圈
         if (challenge) {
-            if (elapsed > CHALLENGE_MAX_MS) sendResult({list: [], error: "cloudflare challenge timeout"});
+            if (elapsed > CHALLENGE_MAX_MS) sendResult({list: [], error: "cloudflare challenge timeout", msg: "supjav 需要先通过 Cloudflare 人机验证"});
             return;
         }
         if (!hasJq()) {
@@ -1117,4 +1168,3 @@
         });
     }
 })();
-
