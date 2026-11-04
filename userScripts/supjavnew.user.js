@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Supjav
 // @namespace    gmspider
-// @version      2026.10.21.1
+// @version      2026.11.04.1
 // @description  Supjav GMSpider（兼容新版播放器 + 屏蔽广告/弹窗视频 + 厂牌分类）
 // @author       Luomo
 // @match        https://supjav.com/*
@@ -40,7 +40,16 @@
     // fresh 模式下最多等影片页多久（毫秒），超时就退回用缓存的地址
     const FRESH_WAIT_MS = 6000;
     // 详情页：DOM 解析完后线路按钮仍未出现（网站用 AJAX 加载线路）时，再等多久（毫秒）
-    const DETAIL_BTN_WAIT_MS = 8000;
+    const DETAIL_BTN_WAIT_MS = 3000;
+    // 详情页总时限（毫秒，从开始打开页面算起）：到点就用已经拿到的内容返回，不再等。
+    // App 自己等详情的时间有限，脚本等太久 App 会先放弃 → “点了打不开，重试多次才偶尔能开”
+    const DETAIL_BUDGET_MS = 8000;
+    // 在详情简介末尾附一行很短的诊断（用时、按什么条件返回、线路按钮数），排查打不开的原因用；不需要时改成 false
+    const DETAIL_DIAG = true;
+    // 轻量加载：正常 supjav 页面（列表/详情）上不下载图片和字体（封面地址照样能取到，App 自己加载封面）。
+    // supjav 页面上的缩略图、广告图很多，WebView 全部下载会明显拖慢列表和详情。
+    // Cloudflare 验证页不受影响（验证页上脚本什么都不改）。
+    const LITE_PAGE = true;
     // 等待页面的最长时间（毫秒），超时后用已有内容返回结果，避免 App 一直转圈
     const MAX_WAIT_MS = 30000;
     // Cloudflare 验证页最多等多久（毫秒），超过就返回结果，避免 App 永远转圈
@@ -330,7 +339,7 @@
                 if (cspAdded || !document.head) return;
                 const meta = document.createElement("meta");
                 meta.httpEquiv = "Content-Security-Policy";
-                meta.content = "media-src 'none'";
+                meta.content = LITE_PAGE ? "media-src 'none'; img-src data:; font-src 'none'" : "media-src 'none'";
                 document.head.insertBefore(meta, document.head.firstChild);
                 cspAdded = true;
             }
@@ -843,6 +852,9 @@
                 const playUrl = lineOrder.map(from => lines[from].map(e => e.name + "$" + e.url).join("#"));
 
                 if (DEBUG) vodContent = "[调试] " + pageDiag() + "\n" + vodContent;
+                else if (DETAIL_DIAG) vodContent += "\n〔诊断 " + ((Date.now() - started) / 1000).toFixed(1) + "s " + detailWhy +
+                    " 线路按钮=" + document.querySelectorAll(".btn-server[data-link]").length +
+                    " 页面=" + document.readyState + "〕";
 
                 return {
                     list: [{
@@ -1078,7 +1090,7 @@
         openPlayer(link);
     }
 
-    let lastBtnCount = -1, stableTicks = 0, domDoneAt = 0;
+    let lastBtnCount = -1, stableTicks = 0, domDoneAt = 0, detailWhy = "";
 
     function hasJq() {
         return typeof jQuery === "function" && jQuery.fn && jQuery.fn.jquery;
@@ -1112,22 +1124,36 @@
             } else if (source === "tick") {
                 stableTicks++;
             }
-            let ready = false;
-            if (overtime) {
+            let ready = false, why = "";
+            const hasMeta = !!document.querySelector(".post-meta .img") &&
+                !!document.querySelector(".post-meta .tags, .post-meta .cats");
+            if (domDone && !domDoneAt) domDoneAt = Date.now();
+            if (n > 0 && domDone) {
                 ready = true;
-            } else if (n > 0) {
-                // 解析中途提前返回：只有当线路区块已经解析完（解析器已经走到它后面的元素），
-                // 且标题/标签已出现时才返回，避免只解析出第一个按钮就返回、丢掉后面的线路
-                ready = domDone || (stableTicks >= 1 && serverBlockClosed() &&
-                    !!document.querySelector(".post-meta .img") &&
-                    !!document.querySelector(".post-meta .tags, .post-meta .cats"));
-            } else if (domDone) {
-                // DOM 已完成但没有线路按钮：可能是 AJAX 加载，触发并等一会儿
-                if (!domDoneAt) domDoneAt = Date.now();
+                why = "页面完成";
+            } else if (n > 0 && stableTicks >= 1 && serverBlockClosed() && (hasMeta || elapsed > 2500)) {
+                // 解析中途提前返回：线路区块已经解析完（解析器已经走到它后面的元素）；
+                // 标题/标签区块一般也已出现，没出现的话最多等 2.5 秒就不等了
+                ready = true;
+                why = "线路就绪";
+            } else if (n > 0 && stableTicks >= 6 && hasMeta) {
+                // 页面后半部分还在慢慢加载，但线路按钮数量已经约 1.5 秒没变：认为线路已齐
+                ready = true;
+                why = "线路稳定";
+            } else if (n === 0 && domDone) {
+                // DOM 已完成但没有线路按钮：可能是 AJAX 加载，触发并短暂等待
                 triggerServerLoad();
-                ready = Date.now() - domDoneAt > DETAIL_BTN_WAIT_MS;
+                if (Date.now() - domDoneAt > DETAIL_BTN_WAIT_MS) {
+                    ready = true;
+                    why = "无线路按钮";
+                }
+            }
+            if (!ready && (elapsed > DETAIL_BUDGET_MS || overtime)) {
+                ready = true;
+                why = "超时返回(" + (domDone ? "页面已完成" : "页面未完成") + ")";
             }
             if (!ready) return;
+            detailWhy = why;
         } else if (!domDone && !overtime) {
             return;
         }
@@ -1168,3 +1194,4 @@
         });
     }
 })();
+
