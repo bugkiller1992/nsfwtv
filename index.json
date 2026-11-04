@@ -352,7 +352,7 @@
     "userScript": "./userScripts/supjavnew.user.js",
     "subtitle": true,
     "webViewSettings": {
-      "blockNetworkImage": false,
+      "blockNetworkImage": true,
       "blockCssAndFont": false,
       "allowList": [
         "*"
