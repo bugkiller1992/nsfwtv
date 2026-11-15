@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Supjav
 // @namespace    gmspider
-// @version      2026.11.04.1
+// @version      2026.11.15.2
 // @description  Supjav GMSpider（兼容新版播放器 + 屏蔽广告/弹窗视频 + 厂牌分类）
 // @author       Luomo
 // @match        https://supjav.com/*
@@ -31,7 +31,9 @@
     // 播放器嗅探到地址、App 开始播放后，网页里的播放器可能还在后台加载同一个视频，和 App 抢带宽。
     // 设成毫秒数（如 15000）：播放器页面加载后过这么久，就关掉网页里的播放器。0 = 不关闭。
     // 注意：设得太短，App 还没嗅探到地址就关了，会直接播放失败。
-    const RELEASE_PLAYER_MS = 0;
+    // 20000：App 一般几秒内就嗅探到地址开始播放；20 秒后关掉网页播放器，避免它在后台继续缓冲同一个视频、和 App 抢网速（卡顿）。
+    // 如果出现“播放一直转圈、播不起来”，改回 0。
+    const RELEASE_PLAYER_MS = 20000;
     // 播放时线路地址从哪里取：
     // "fresh"：打开影片页，按线路名（TV/ST/VOE...）取页面上最新的 data-link（推荐）。
     //          新片/更新过的影片线路会被网站替换，详情里缓存的旧地址会失效 → 播放失败。
@@ -44,6 +46,9 @@
     // 详情页总时限（毫秒，从开始打开页面算起）：到点就用已经拿到的内容返回，不再等。
     // App 自己等详情的时间有限，脚本等太久 App 会先放弃 → “点了打不开，重试多次才偶尔能开”
     const DETAIL_BUDGET_MS = 8000;
+    // 详情页打开后落在 Cloudflare 验证页、且一直过不去时，最多等多久（毫秒）就先返回一个“自动”线路的详情。
+    // 旧版会一直等到 60 秒，正好和 App 的超时一样长 → App 先放弃，详情打不开，只能退出重进碰运气。
+    const DETAIL_CHALLENGE_MS = 10000;
     // 在详情简介末尾附一行很短的诊断（用时、按什么条件返回、线路按钮数），排查打不开的原因用；不需要时改成 false
     const DETAIL_DIAG = true;
     // 轻量加载：正常 supjav 页面（列表/详情）上不下载图片和字体（封面地址照样能取到，App 自己加载封面）。
@@ -894,6 +899,7 @@
             },
 
             _resolveLink: resolveLink,
+            _buildPlayPageUrl: buildPlayPageUrl,
             _readPlayParams: readPlayParams,
             _getServerGroups: getServerGroups,
 
@@ -1104,6 +1110,20 @@
 
         if (fName === "playerContent") return runPlayer(elapsed, challenge);
 
+        // 详情页一直停在验证页：不再等到 App 超时，先返回只有“自动”线路的详情（播放时再去页面取线路），
+        // 并在简介里注明，方便判断问题出在验证上
+        if (challenge && fName === "detailContent" && elapsed > DETAIL_CHALLENGE_MS) {
+            const id = String((GMSpiderArgs.fArgs[0] || [])[0] || "");
+            sendResult({list: [{
+                vod_id: id,
+                vod_name: id.replace(/\.html$/, ""),
+                vod_content: "网站要求 Cloudflare 验证，影片信息暂时没取到；可以先试着播放“自动”线路，或退出重进。\n〔诊断 " +
+                    (elapsed / 1000).toFixed(1) + "s 验证页未通过 标题=" + (document.title || "").slice(0, 30) + "〕",
+                vod_play_from: "自动",
+                vod_play_url: "播放$" + GmSpider._buildPlayPageUrl(id, 0, "", "", 0)
+            }]});
+            return;
+        }
         // 验证页：等验证通过后页面自动刷新；但最多等 CHALLENGE_MAX_MS，避免 App 永远转圈
         if (challenge) {
             if (elapsed > CHALLENGE_MAX_MS) sendResult({list: [], error: "cloudflare challenge timeout", msg: "supjav 需要先通过 Cloudflare 人机验证"});
@@ -1194,4 +1214,3 @@
         });
     }
 })();
-
