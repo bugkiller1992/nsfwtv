@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Supjav
 // @namespace    gmspider
-// @version      2026.11.15.2
+// @version      2026.11.23.1
 // @description  Supjav GMSpider（兼容新版播放器 + 屏蔽广告/弹窗视频 + 厂牌分类）
 // @author       Luomo
 // @match        https://supjav.com/*
@@ -33,12 +33,18 @@
     // 注意：设得太短，App 还没嗅探到地址就关了，会直接播放失败。
     // 20000：App 一般几秒内就嗅探到地址开始播放；20 秒后关掉网页播放器，避免它在后台继续缓冲同一个视频、和 App 抢网速（卡顿）。
     // 如果出现“播放一直转圈、播不起来”，改回 0。
-    const RELEASE_PLAYER_MS = 20000;
+    const RELEASE_PLAYER_MS = 0;
     // 播放时线路地址从哪里取：
     // "fresh"：打开影片页，按线路名（TV/ST/VOE...）取页面上最新的 data-link（推荐）。
     //          新片/更新过的影片线路会被网站替换，详情里缓存的旧地址会失效 → 播放失败。
     // "cached"：直接用详情页生成时写进播放链接的地址（最快，但旧地址失效时无法播放）
     const PLAY_LINK_SOURCE = "fresh";
+    // 详情是多久以内取的，就直接用详情里的线路地址播放、不再重新打开影片页（秒）。
+    // 刚打开的详情，地址就是最新的；重新打开影片页又会碰上网站慢 / Cloudflare 验证，播放要点很多次。
+    // 超过这个时间（比如从很久以前的历史记录播放），才回到影片页取最新地址。
+    const LINK_FRESH_SEC = 6 * 3600;
+    // 播放时如果还是要打开影片页、而它卡在 Cloudflare 验证上：最多等多久（毫秒）就改用详情里的地址或放弃
+    const PLAY_CHALLENGE_MS = 8000;
     // fresh 模式下最多等影片页多久（毫秒），超时就退回用缓存的地址
     const FRESH_WAIT_MS = 6000;
     // 详情页：DOM 解析完后线路按钮仍未出现（网站用 AJAX 加载线路）时，再等多久（毫秒）
@@ -620,12 +626,12 @@
             let u = "https://supjav.com/zh/" + vodId + "?gmsrv=" + idx;
             if (cd !== undefined) u += "&gmcd=" + cd;
             if (name) u += "&gmname=" + encodeURIComponent(name);
-            if (link) u += "&gmlink=" + encodeURIComponent(link);
+            if (link) u += "&gmlink=" + encodeURIComponent(link) + "&gmts=" + Math.floor(Date.now() / 1000);
             return u;
         }
 
         function readPlayParams(id) {
-            const p = {idx: NaN, cd: 0, name: "", link: ""};
+            const p = {idx: NaN, cd: 0, name: "", link: "", ts: 0};
             const sources = [location.href];
             if (typeof id === "string") sources.push(id);
             for (const s of sources) {
@@ -636,6 +642,7 @@
                     p.cd = parseInt(u.searchParams.get("gmcd") || "0", 10) || 0;
                     p.name = u.searchParams.get("gmname") || "";
                     p.link = u.searchParams.get("gmlink") || "";
+                    p.ts = parseInt(u.searchParams.get("gmts") || "0", 10) || 0;
                     return p;
                 }
                 // 兼容旧版 #序号
@@ -1074,7 +1081,9 @@
     function runPlayer(elapsed, challenge) {
         const p = GmSpider._readPlayParams(getPlayArg());
         let link = "";
-        if (PLAY_LINK_SOURCE === "cached" && p.link) {
+        const linkAge = p.ts ? Date.now() / 1000 - p.ts : Infinity;
+        if (p.link && (PLAY_LINK_SOURCE === "cached" || linkAge < LINK_FRESH_SEC)) {
+            // 地址是刚取到的：页面一开始加载就直接打开播放器，不等影片页（也不会碰上验证页）
             link = p.link;
         } else if (!pendingLink) {
             if (!challenge && hasJq()) {
@@ -1085,7 +1094,7 @@
             }
             // 页面迟迟拿不到（验证页 / 网站很慢）：退回到详情里缓存的地址
             if (!link && elapsed > FRESH_WAIT_MS && p.link) link = p.link;
-            if (!link && elapsed > (challenge ? CHALLENGE_MAX_MS : MAX_WAIT_MS)) {
+            if (!link && elapsed > (challenge ? PLAY_CHALLENGE_MS : MAX_WAIT_MS)) {
                 sendResult({type: "match"});
                 return;
             }
